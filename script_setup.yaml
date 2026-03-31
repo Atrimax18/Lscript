@@ -1,0 +1,44 @@
+serial:
+  nxp:
+    port: COM20
+    baudrate: 115200
+  switch:
+    port: COM21
+    baudrate: 115200
+  sx1: 
+    port: COM22
+    baudrate: 115200
+  sx2: 
+    port: COM23
+    baudrate: 115200
+
+server:
+  ip: 10.10.10.1
+  login: deploy
+  password: deploy
+  image_path: images
+
+dut:
+  final_ip: 10.10.10.2
+  login: root
+  password: toor
+  utils_path: LSBB_Utils
+  tmp_path: tmp
+
+switch:
+  ip: 192.168.2.2
+  prompt: "Telesat>"
+
+sonic:
+  login: admin
+  password: admin
+
+prompts:
+  u_boot: "U-Boot"
+  switch: "Telesat>"
+
+timeouts:
+  serial_open_seconds: 10
+  prompt_wait_seconds: 15
+  boot_interrupt_seconds: 5
+  first_boot_seconds: 300
