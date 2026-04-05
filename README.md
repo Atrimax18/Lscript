@@ -4,10 +4,11 @@ Windows-driven serial automation for the LSBB lab flow.
 
 The script now supports two modes:
 
-- `detect`: stop NXP autoboot on `COM20` and confirm the switch `Telesat>` prompt on `COM21`
+- `detect`: stop NXP autoboot on `COM20` and confirm the switch `Telesat>>` prompt on `COM21`
+- `mac-only`: stop both sides in U-Boot, program NXP and switch MACs, and stop there
 - `provision`: run the documented flow from MAC programming through Linux install, switch image install, SONiC setup, and `LSBB_Utils`
 
-Serial logs are saved under `logs/`.
+Serial logs are saved under `logs/`, and both `COM20` and `COM21` are opened and logged from the start of the run.
 
 ## Detect Mode
 
@@ -78,7 +79,8 @@ python .\lscript.py --mode provision `
 ## What Provision Mode Does
 
 - Stops autoboot on the NXP console and enters U-Boot
-- Waits for the switch `Telesat>` U-Boot prompt
+- Monitors NXP and switch boot in parallel from the start of the run
+- Waits for the switch `Telesat>>` U-Boot prompt
 - Writes NXP `mac 0` from the runtime argument
 - Writes fixed NXP values to `mac 1`, `mac 2`, and `mac 3`
 - Burns the switch U-Boot MAC with `setenv ethaddr` using `base-mac + 1`
@@ -114,3 +116,20 @@ The Word manual includes some unclear or placeholder text that was not converted
 - The upgrade section with `swupdate-client`, which appears to be a separate flow
 
 Those steps will need the exact intended commands before they can be automated safely.
+
+## MAC-Only Mode
+
+To stop both chips in U-Boot, write the NXP MAC set, write the switch `ethaddr`, and stop there:
+
+```powershell
+python .\lscript.py --mode mac-only --base-mac 70:B3:D5:97:07:C0
+```
+
+This mode does only:
+
+- stop NXP in U-Boot
+- stop switch in U-Boot
+- write NXP `mac 0` from `--base-mac`
+- write fixed NXP values to `mac 1`, `mac 2`, `mac 3`
+- write switch `ethaddr` as `base-mac + 1`
+- save both sides and exit

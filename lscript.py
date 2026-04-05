@@ -12,13 +12,16 @@ from typing import Any
 import serial
 
 
-AUTOBOOT_PATTERN = re.compile(r"Hit any key to stop autoboot:\s*3", re.IGNORECASE)
+AUTOBOOT_PATTERN = re.compile(r"Hit any key to stop autoboot:", re.IGNORECASE)
 LOGIN_PATTERN = re.compile(r"(?:^|\n).{0,40}login:\s*$", re.IGNORECASE | re.MULTILINE)
 PASSWORD_PATTERN = re.compile(r"(?:^|\n).{0,80}password(?: for [^:]+)?:\s*$", re.IGNORECASE | re.MULTILINE)
 HOST_KEY_CONFIRM_PATTERN = re.compile(r"are you sure you want to continue connecting", re.IGNORECASE)
 ROOT_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}#\s*$", re.MULTILINE)
 USER_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}(?:\$|>)\s*$", re.MULTILINE)
 UBOOT_PROMPT_PATTERN = re.compile(r"(?:^|\n)\s*=>\s*$", re.MULTILINE)
+MAC_SAVE_SUCCESS_PATTERN = re.compile(r"Programming passed\.", re.IGNORECASE)
+SWITCH_ENV_RESET_PATTERN = re.compile(r"## Resetting to default environment", re.IGNORECASE)
+SWITCH_SAVEENV_OK_PATTERN = re.compile(r"(^|\n)OK\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 class ConfigError(RuntimeError):
@@ -271,6 +274,14 @@ def boot_stop_bytes(mode: str) -> bytes:
     raise ValueError(f"Unsupported boot stop key mode: {mode}")
 
 
+def compile_switch_prompt_pattern(prompt_text: str) -> re.Pattern[str]:
+    prompt = prompt_text.strip()
+    if prompt.endswith(">"):
+        stem = re.escape(prompt.rstrip(">"))
+        return re.compile(r"(?:^|\n)\s*" + stem + r">+\s*$", re.IGNORECASE | re.MULTILINE)
+    return re.compile(r"(?:^|\n)\s*" + re.escape(prompt) + r"\s*$", re.IGNORECASE | re.MULTILINE)
+
+
 class SerialSession:
     def __init__(self, name: str, config: SerialPortConfig, log_path: pathlib.Path, open_timeout: int) -> None:
         self.name = name
@@ -339,7 +350,7 @@ class SerialSession:
         start_pos: int | None = None,
     ) -> re.Match[str]:
         deadline = time.monotonic() + timeout
-        scan_from = max(0, (start_pos or 0) - 200)
+        scan_from = start_pos if start_pos is not None else 0
         while time.monotonic() < deadline:
             self.poll()
             segment = self.buffer[scan_from:]
@@ -357,7 +368,7 @@ class SerialSession:
         start_pos: int | None = None,
     ) -> str:
         deadline = time.monotonic() + timeout
-        scan_from = max(0, (start_pos or 0) - 200)
+        scan_from = start_pos if start_pos is not None else 0
         while time.monotonic() < deadline:
             self.poll()
             segment = self.buffer[scan_from:]
@@ -471,14 +482,26 @@ def ensure_linux_shell(
 
 def detect_nxp_uboot(
     session: SerialSession,
-    interrupt_timeout: int,
+    autoboot_wait_timeout: int,
     prompt_timeout: int,
     stop_key: bytes,
 ) -> None:
-    session.wait_for_pattern(AUTOBOOT_PATTERN, timeout=interrupt_timeout, label="autoboot countdown")
-    for _ in range(3):
+    session.wait_for_pattern(AUTOBOOT_PATTERN, timeout=autoboot_wait_timeout, label="autoboot countdown")
+    deadline = time.monotonic() + max(prompt_timeout, 6)
+    while time.monotonic() < deadline:
         session.write(stop_key)
-        time.sleep(0.1)
+        try:
+            session.wait_for_any_pattern(
+                {
+                    "prompt": UBOOT_PROMPT_PATTERN,
+                    "banner": re.compile(r"U-Boot", re.IGNORECASE),
+                },
+                timeout=0.25,
+                label="U-Boot prompt",
+            )
+            return
+        except TimeoutError:
+            time.sleep(0.15)
     session.wait_for_any_pattern(
         {
             "prompt": UBOOT_PROMPT_PATTERN,
@@ -495,10 +518,65 @@ def detect_switch_prompt(
     timeout: int,
     fresh: bool = False,
 ) -> re.Pattern[str]:
-    pattern = re.compile(re.escape(prompt_text))
+    pattern = compile_switch_prompt_pattern(prompt_text)
     start_pos = len(session.buffer) if fresh else None
     session.wait_for_pattern(pattern, timeout=timeout, label="switch prompt", start_pos=start_pos)
     return pattern
+
+
+def monitor_boot_parallel(
+    nxp: SerialSession,
+    switch: SerialSession,
+    switch_prompt_text: str,
+    stop_key: bytes,
+    timeout: int,
+) -> tuple[bool, bool, re.Pattern[str]]:
+    switch_pattern = compile_switch_prompt_pattern(switch_prompt_text)
+    deadline = time.monotonic() + timeout
+    nxp_captured = False
+    switch_ready = False
+    nxp_interrupting = False
+    switch_interrupting = False
+    interrupt_deadline = 0.0
+    switch_interrupt_deadline = 0.0
+
+    while time.monotonic() < deadline:
+        nxp.poll()
+        switch.poll()
+
+        if not nxp_interrupting and AUTOBOOT_PATTERN.search(nxp.buffer):
+            nxp_interrupting = True
+            interrupt_deadline = time.monotonic() + 6
+
+        if nxp_interrupting and not nxp_captured:
+            nxp.write(stop_key)
+            if UBOOT_PROMPT_PATTERN.search(nxp.buffer):
+                nxp_captured = True
+                nxp_interrupting = False
+            elif time.monotonic() > interrupt_deadline:
+                nxp_interrupting = False
+
+        if not switch_interrupting and AUTOBOOT_PATTERN.search(switch.buffer):
+            switch_interrupting = True
+            switch_interrupt_deadline = time.monotonic() + 6
+
+        if switch_interrupting and not switch_ready:
+            switch.write(stop_key)
+            if switch_pattern.search(switch.buffer):
+                switch_ready = True
+                switch_interrupting = False
+            elif time.monotonic() > switch_interrupt_deadline:
+                switch_interrupting = False
+
+        if switch_pattern.search(switch.buffer):
+            switch_ready = True
+
+        if nxp_captured and switch_ready:
+            return True, True, switch_pattern
+
+        time.sleep(0.1)
+
+    return nxp_captured, switch_ready, switch_pattern
 
 
 def remote_server_path(server: ServerConfig, filename: str) -> str:
@@ -551,20 +629,69 @@ def burn_nxp_macs(session: SerialSession, provision: ProvisionArgs, timeout: int
         f"mac 1 {provision.nxp_mac1}",
         f"mac 2 {provision.nxp_mac2}",
         f"mac 3 {provision.nxp_mac3}",
-        "mac save",
     ]
     for command in commands:
         run_command(session, command, UBOOT_PROMPT_PATTERN, timeout, description=f"NXP U-Boot: {command}")
+    info("NXP: NXP U-Boot: mac save")
+    start_pos = len(session.buffer)
+    session.send_line("mac save")
+    session.wait_for_pattern(
+        MAC_SAVE_SUCCESS_PATTERN,
+        timeout=timeout,
+        label="mac save success",
+        start_pos=start_pos,
+    )
+    session.wait_for_pattern(
+        UBOOT_PROMPT_PATTERN,
+        timeout=timeout,
+        label="U-Boot prompt after mac save",
+        start_pos=start_pos,
+    )
 
 
 def burn_switch_uboot_mac(session: SerialSession, prompt_pattern: re.Pattern[str], provision: ProvisionArgs, timeout: int) -> None:
-    commands = [
-        "env default -a",
-        f"setenv ethaddr {provision.switch_uboot_mac}",
-        "saveenv",
-    ]
-    for command in commands:
-        run_command(session, command, prompt_pattern, timeout, description=f"Switch U-Boot: {command}")
+    info("Switch: Switch U-Boot: env default -a")
+    start_pos = len(session.buffer)
+    session.send_line("env default -a")
+    session.wait_for_pattern(
+        SWITCH_ENV_RESET_PATTERN,
+        timeout=timeout,
+        label="switch environment reset message",
+        start_pos=start_pos,
+    )
+    session.wait_for_pattern(
+        prompt_pattern,
+        timeout=timeout,
+        label="switch prompt after env default -a",
+        start_pos=start_pos,
+    )
+
+    setenv_command = f"setenv ethaddr {provision.switch_uboot_mac}"
+    info(f"Switch: Switch U-Boot: {setenv_command}")
+    start_pos = len(session.buffer)
+    session.send_line(setenv_command)
+    session.wait_for_pattern(
+        prompt_pattern,
+        timeout=timeout,
+        label="switch prompt after setenv ethaddr",
+        start_pos=start_pos,
+    )
+
+    info("Switch: Switch U-Boot: saveenv")
+    start_pos = len(session.buffer)
+    session.send_line("saveenv")
+    session.wait_for_pattern(
+        SWITCH_SAVEENV_OK_PATTERN,
+        timeout=max(timeout, 30),
+        label="switch saveenv OK",
+        start_pos=start_pos,
+    )
+    session.wait_for_pattern(
+        prompt_pattern,
+        timeout=max(timeout, 30),
+        label="switch prompt after saveenv",
+        start_pos=start_pos,
+    )
 
 
 def configure_emergency_linux(session: SerialSession, config: AppConfig, provision: ProvisionArgs) -> None:
@@ -721,28 +848,85 @@ def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: path
     nxp_log = timestamped_log_path(repo_root, "nxp")
     switch_log = timestamped_log_path(repo_root, "switch")
     info(f"Watching NXP console on {config.nxp.port}; log: {nxp_log}")
+    if not args.skip_switch:
+        info(f"Watching switch console on {config.switch_serial.port}; log: {switch_log}")
 
     try:
-        with SerialSession("NXP", config.nxp, nxp_log, config.timeouts.serial_open_seconds) as nxp:
-            detect_nxp_uboot(
-                session=nxp,
-                interrupt_timeout=config.timeouts.boot_interrupt_seconds,
-                prompt_timeout=config.timeouts.prompt_wait_seconds,
+        with SerialSession("NXP", config.nxp, nxp_log, config.timeouts.serial_open_seconds) as nxp, SerialSession(
+            "Switch",
+            config.switch_serial,
+            switch_log,
+            config.timeouts.serial_open_seconds,
+        ) as switch:
+            if args.skip_switch:
+                detect_nxp_uboot(
+                    session=nxp,
+                    autoboot_wait_timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+                    prompt_timeout=config.timeouts.prompt_wait_seconds,
+                    stop_key=boot_stop_bytes(args.boot_stop_key),
+                )
+                ok(f"Reached U-Boot on {config.nxp.port}")
+                return 0
+
+            nxp_ready, switch_ready, _ = monitor_boot_parallel(
+                nxp=nxp,
+                switch=switch,
+                switch_prompt_text=config.prompts.switch,
                 stop_key=boot_stop_bytes(args.boot_stop_key),
+                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
             )
+            if not nxp_ready:
+                raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
+            if not switch_ready:
+                raise TimeoutError(f"Timed out waiting for switch prompt on {config.switch_serial.port}")
             ok(f"Reached U-Boot on {config.nxp.port}")
-
-        if args.skip_switch:
-            return 0
-
-        info(f"Watching switch console on {config.switch_serial.port}; log: {switch_log}")
-        with SerialSession("Switch", config.switch_serial, switch_log, config.timeouts.serial_open_seconds) as switch:
-            detect_switch_prompt(switch, config.prompts.switch, config.timeouts.prompt_wait_seconds)
-            ok(f"Reached {config.prompts.switch!r} on {config.switch_serial.port}")
+            ok(f"Reached switch prompt on {config.switch_serial.port}")
     except (serial.SerialException, TimeoutError, ValueError, RuntimeError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
+    return 0
+
+
+def run_mac_only_mode(config: AppConfig, args: argparse.Namespace, repo_root: pathlib.Path) -> int:
+    provision = build_provision_args(args)
+    nxp_log = timestamped_log_path(repo_root, "nxp")
+    switch_log = timestamped_log_path(repo_root, "switch")
+
+    info(f"NXP base MAC: {provision.base_mac}")
+    info(f"Switch U-Boot MAC: {provision.switch_uboot_mac}")
+    info(f"NXP log: {nxp_log}")
+    info(f"Switch log: {switch_log}")
+
+    try:
+        with SerialSession("NXP", config.nxp, nxp_log, config.timeouts.serial_open_seconds) as nxp, SerialSession(
+            "Switch",
+            config.switch_serial,
+            switch_log,
+            config.timeouts.serial_open_seconds,
+        ) as switch:
+            nxp_ready, switch_ready, switch_prompt = monitor_boot_parallel(
+                nxp=nxp,
+                switch=switch,
+                switch_prompt_text=config.prompts.switch,
+                stop_key=boot_stop_bytes(args.boot_stop_key),
+                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+            )
+            if not nxp_ready:
+                raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
+            if not switch_ready:
+                raise TimeoutError(f"Timed out waiting for switch prompt on {config.switch_serial.port}")
+
+            ok("NXP U-Boot is ready")
+            ok("Switch U-Boot is ready")
+
+            burn_nxp_macs(nxp, provision, config.timeouts.prompt_wait_seconds)
+            burn_switch_uboot_mac(switch, switch_prompt, provision, config.timeouts.prompt_wait_seconds)
+    except (serial.SerialException, TimeoutError, ValueError, RuntimeError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    ok("MAC programming completed")
     return 0
 
 
@@ -765,16 +949,18 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
             config.timeouts.serial_open_seconds,
         ) as switch:
             info("Stopping NXP autoboot and entering U-Boot")
-            detect_nxp_uboot(
-                session=nxp,
-                interrupt_timeout=config.timeouts.boot_interrupt_seconds,
-                prompt_timeout=config.timeouts.prompt_wait_seconds,
+            nxp_ready, switch_ready, switch_prompt = monitor_boot_parallel(
+                nxp=nxp,
+                switch=switch,
+                switch_prompt_text=config.prompts.switch,
                 stop_key=boot_stop_bytes(args.boot_stop_key),
+                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
             )
+            if not nxp_ready:
+                raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
+            if not switch_ready:
+                raise TimeoutError(f"Timed out waiting for switch prompt on {config.switch_serial.port}")
             ok("NXP U-Boot is ready")
-
-            info("Waiting for the switch U-Boot prompt")
-            switch_prompt = detect_switch_prompt(switch, config.prompts.switch, config.timeouts.first_boot_seconds, fresh=True)
             ok("Switch U-Boot is ready")
 
             burn_nxp_macs(nxp, provision, config.timeouts.prompt_wait_seconds)
@@ -817,9 +1003,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["detect", "provision"],
+        choices=["detect", "mac-only", "provision"],
         default="detect",
-        help="Run the quick prompt detector or the full provisioning flow.",
+        help="Run the quick prompt detector, MAC-only flow, or the full provisioning flow.",
     )
     parser.add_argument(
         "--boot-stop-key",
@@ -871,6 +1057,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(config_path)
+        if args.mode == "mac-only":
+            return run_mac_only_mode(config, args, repo_root)
         if args.mode == "provision":
             return run_provision_mode(config, args, repo_root)
         return run_detect_mode(config, args, repo_root)

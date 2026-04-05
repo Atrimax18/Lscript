@@ -27,7 +27,7 @@ dut:
 
 switch:
   ip: 192.168.2.2
-  prompt: "Telesat>"
+  prompt: "Telesat>>"
 
 sonic:
   login: admin
@@ -35,7 +35,7 @@ sonic:
 
 prompts:
   u_boot: "U-Boot"
-  switch: "Telesat>"
+  switch: "Telesat>>"
 
 timeouts:
   serial_open_seconds: 10
