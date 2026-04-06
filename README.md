@@ -68,6 +68,8 @@ python .\lscript.py --mode provision `
   --switch-itb telesat_lsbb-r0.itb
 ```
 
+If `server.image_file` is present in [script_setup.yaml](C:/Users/alexeyt/source/repos/Lscript/script_setup.yaml), the deploy script filename is read from YAML by default.
+
 To skip the final `LSBB_Utils` copy and run:
 
 ```powershell
@@ -84,8 +86,8 @@ python .\lscript.py --mode provision `
 - Writes NXP `mac 0` from the runtime argument
 - Writes fixed NXP values to `mac 1`, `mac 2`, and `mac 3`
 - Burns the switch U-Boot MAC with `setenv ethaddr` using `base-mac + 1`
-- Pauses for the physical DUT reset into emergency Linux
-- Configures DUT IP, pulls the deploy script from the Linux server, and runs it
+- Pauses for the physical DUT reset into emergency Linux and waits for the `sh-5.2#` prompt on the NXP terminal
+- Configures DUT IP, verifies `ping` to the image server, pulls the deploy script, verifies it appears in `/tmp`, and only then runs it
 - Pauses for the documented reboot steps
 - Configures persistent DUT networking with `nmcli`
 - Copies switch image files to `/tmp`

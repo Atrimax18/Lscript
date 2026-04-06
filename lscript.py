@@ -22,6 +22,8 @@ UBOOT_PROMPT_PATTERN = re.compile(r"(?:^|\n)\s*=>\s*$", re.MULTILINE)
 MAC_SAVE_SUCCESS_PATTERN = re.compile(r"Programming passed\.", re.IGNORECASE)
 SWITCH_ENV_RESET_PATTERN = re.compile(r"## Resetting to default environment", re.IGNORECASE)
 SWITCH_SAVEENV_OK_PATTERN = re.compile(r"(^|\n)OK\s*$", re.IGNORECASE | re.MULTILINE)
+PING_SUCCESS_PATTERN = re.compile(r"(?:\b1 packets transmitted,\s*1 packets received\b|(?:\b1 received\b)|bytes from)", re.IGNORECASE)
+EMERGENCY_SHELL_PATTERN = re.compile(r"(?:^|\n)\s*sh-5\.2#\s*$", re.MULTILINE)
 
 
 class ConfigError(RuntimeError):
@@ -144,6 +146,7 @@ class ServerConfig:
     login: str
     password: str
     image_path: str
+    image_file: str
 
 
 @dataclass(frozen=True)
@@ -215,6 +218,7 @@ class AppConfig:
                 login=str(server_cfg["login"]),
                 password=str(server_cfg["password"]),
                 image_path=str(server_cfg["image_path"]),
+                image_file=str(server_cfg.get("image_file", "deploy-lsbb-1.1.1-20260324.sh")),
             ),
             dut=DutConfig(
                 final_ip=str(dut_cfg["final_ip"]),
@@ -393,6 +397,21 @@ def run_command(
     session.wait_for_pattern(prompt_pattern, timeout=timeout, label=f"command completion for: {command}", start_pos=start_pos)
 
 
+def run_command_capture(
+    session: SerialSession,
+    command: str,
+    prompt_pattern: re.Pattern[str],
+    timeout: int,
+    description: str | None = None,
+) -> str:
+    if description:
+        info(f"{session.name}: {description}")
+    start_pos = len(session.buffer)
+    session.send_line(command)
+    session.wait_for_pattern(prompt_pattern, timeout=timeout, label=f"command completion for: {command}", start_pos=start_pos)
+    return session.buffer[start_pos:]
+
+
 def run_command_with_optional_password(
     session: SerialSession,
     command: str,
@@ -478,6 +497,16 @@ def ensure_linux_shell(
         start_pos = len(session.buffer)
         session.send_line(password)
         session.wait_for_pattern(shell_prompt, timeout=boot_timeout, label="linux shell", start_pos=start_pos)
+
+
+def ensure_emergency_shell(session: SerialSession, boot_timeout: int, fresh: bool = False) -> None:
+    start_pos = len(session.buffer) if fresh else None
+    session.wait_for_pattern(
+        EMERGENCY_SHELL_PATTERN,
+        timeout=boot_timeout,
+        label="emergency shell prompt",
+        start_pos=start_pos,
+    )
 
 
 def detect_nxp_uboot(
@@ -600,9 +629,9 @@ class ProvisionArgs:
     skip_utils: bool
 
 
-def build_provision_args(args: argparse.Namespace) -> ProvisionArgs:
-    if args.mode == "provision" and args.base_mac is None:
-        raise ValueError("Provision mode requires: --base-mac")
+def build_provision_args(config: AppConfig, args: argparse.Namespace) -> ProvisionArgs:
+    if args.mode in {"mac-only", "provision"} and args.base_mac is None:
+        raise ValueError(f"{args.mode} mode requires: --base-mac")
 
     base_mac = normalize_mac(args.base_mac)
     return ProvisionArgs(
@@ -612,7 +641,7 @@ def build_provision_args(args: argparse.Namespace) -> ProvisionArgs:
         nxp_mac3="00:04:9F:08:44:A4",
         switch_uboot_mac=normalize_mac(args.switch_uboot_mac or mac_plus(base_mac, 1)),
         switch_onie_mac=normalize_mac(args.switch_onie_mac or mac_plus(base_mac, 1)),
-        deploy_script=args.deploy_script,
+        deploy_script=args.deploy_script or config.server.image_file,
         switch_image=args.switch_image,
         switch_itb=args.switch_itb,
         skip_utils=bool(args.skip_utils),
@@ -695,10 +724,18 @@ def burn_switch_uboot_mac(session: SerialSession, prompt_pattern: re.Pattern[str
 
 
 def configure_emergency_linux(session: SerialSession, config: AppConfig, provision: ProvisionArgs) -> None:
-    shell = ROOT_SHELL_PATTERN
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.first_boot_seconds, fresh=True)
+    shell = EMERGENCY_SHELL_PATTERN
+    ensure_emergency_shell(session, config.timeouts.first_boot_seconds, fresh=True)
     run_command(session, f"ifconfig eth0 {config.dut.final_ip}", shell, config.timeouts.prompt_wait_seconds, "Configure DUT emergency IP")
-    run_command(session, f"ping -c 1 {config.server.ip}", shell, config.timeouts.prompt_wait_seconds, "Verify DUT can reach the image server")
+    ping_output = run_command_capture(
+        session,
+        f"ping -c 1 {config.server.ip}",
+        shell,
+        config.timeouts.prompt_wait_seconds,
+        "Verify DUT can reach the image server",
+    )
+    if not PING_SUCCESS_PATTERN.search(ping_output):
+        raise RuntimeError(f"Ping to {config.server.ip} failed; stopping before SCP.")
     run_scp_download(
         session=session,
         server_login=config.server.login,
@@ -710,7 +747,15 @@ def configure_emergency_linux(session: SerialSession, config: AppConfig, provisi
         timeout=max(config.timeouts.first_boot_seconds, 120),
     )
     run_command(session, f"cd /{config.dut.tmp_path}", shell, config.timeouts.prompt_wait_seconds, "Change to the temporary directory")
-    run_command(session, "ls -all", shell, config.timeouts.prompt_wait_seconds, "List the temporary directory")
+    ls_output = run_command_capture(
+        session,
+        "ls -all",
+        shell,
+        config.timeouts.prompt_wait_seconds,
+        "List the temporary directory",
+    )
+    if provision.deploy_script not in ls_output:
+        raise RuntimeError(f"Expected {provision.deploy_script} in /{config.dut.tmp_path}, but it was not listed after SCP.")
     run_command(
         session,
         f"sh ./{provision.deploy_script}",
@@ -889,7 +934,7 @@ def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: path
 
 
 def run_mac_only_mode(config: AppConfig, args: argparse.Namespace, repo_root: pathlib.Path) -> int:
-    provision = build_provision_args(args)
+    provision = build_provision_args(config, args)
     nxp_log = timestamped_log_path(repo_root, "nxp")
     switch_log = timestamped_log_path(repo_root, "switch")
 
@@ -931,7 +976,7 @@ def run_mac_only_mode(config: AppConfig, args: argparse.Namespace, repo_root: pa
 
 
 def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: pathlib.Path) -> int:
-    provision = build_provision_args(args)
+    provision = build_provision_args(config, args)
     nxp_log = timestamped_log_path(repo_root, "nxp")
     switch_log = timestamped_log_path(repo_root, "switch")
 

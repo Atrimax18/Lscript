@@ -24,6 +24,7 @@ dut:
   password: toor
   utils_path: LSBB_Utils
   tmp_path: tmp
+  image_file: deploy-lsbb-1.1.1-20260324.sh
 
 switch:
   ip: 192.168.2.2
