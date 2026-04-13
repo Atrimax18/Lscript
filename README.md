@@ -68,7 +68,18 @@ python .\lscript.py --mode provision `
   --switch-itb telesat_lsbb-r0.itb
 ```
 
-If `server.image_file` is present in [script_setup.yaml](C:/Users/alexeyt/source/repos/Lscript/script_setup.yaml), the deploy script filename is read from YAML by default.
+If these fields are present in [script_setup.yaml](C:/Users/alexeyt/source/repos/Lscript/script_setup.yaml), the filenames are read from YAML by default:
+
+- `dut.image_file` for the deploy script
+- `switch.image_file` for the switch ITB
+- `sonic.image_file` for the SONiC image
+
+Timeouts are now separated in YAML:
+
+- `timeouts.uboot_boot_seconds` for the U-Boot capture phase
+- `timeouts.emergency_boot_seconds` for the reboot into emergency Linux
+
+`timeouts.first_boot_seconds` is still accepted as a fallback for older configs.
 
 To skip the final `LSBB_Utils` copy and run:
 
@@ -82,11 +93,12 @@ python .\lscript.py --mode provision `
 
 - Stops autoboot on the NXP console and enters U-Boot
 - Monitors NXP and switch boot in parallel from the start of the run
+- Verifies on NXP boot that both CLUs are locked and that `Switch ready` and `FPGA ready` appear before continuing
 - Waits for the switch `Telesat>>` U-Boot prompt
 - Writes NXP `mac 0` from the runtime argument
 - Writes fixed NXP values to `mac 1`, `mac 2`, and `mac 3`
 - Burns the switch U-Boot MAC with `setenv ethaddr` using `base-mac + 1`
-- Pauses for the physical DUT reset into emergency Linux and waits for the `sh-5.2#` prompt on the NXP terminal
+- Pauses for the physical DUT reset into emergency Linux, waits for the maintenance message, and then waits for the `sh-5.2#` prompt on the NXP terminal
 - Configures DUT IP, verifies `ping` to the image server, pulls the deploy script, verifies it appears in `/tmp`, and only then runs it
 - Pauses for the documented reboot steps
 - Configures persistent DUT networking with `nmcli`
@@ -124,7 +136,7 @@ Those steps will need the exact intended commands before they can be automated s
 To stop both chips in U-Boot, write the NXP MAC set, write the switch `ethaddr`, and stop there:
 
 ```powershell
-python .\lscript.py --mode mac-only --base-mac 70:B3:D5:97:07:C0
+python .\lscript.py --mode mac-only --base-mac 70:B3:D5:97:07:D8
 ```
 
 This mode does only:

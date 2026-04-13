@@ -11,7 +11,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["--mode", "detect", "provision", "mac-only", "--base-mac", "70:B3:D5:97:07:AE"]
+            "args": ["--mode provision", "--base-mac 70:B3:D5:97:07:D8"]
         }
     ]
 }

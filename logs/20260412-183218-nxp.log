@@ -109,8 +109,8 @@ mac id
 [TX] mac ports 4
 mac ports 4
 => 
-[TX] mac 0 70:B3:D5:97:07:AE
-mac 0 70:B3:D5:97:07:AE
+[TX] mac 0 70:B3:D5:97:07:D8
+mac 0 70:B3:D5:97:07:D8
 => 
 [TX] mac 1 00:04:9F:08:44:A2
 mac 1 00:04:9F:08:44:A2

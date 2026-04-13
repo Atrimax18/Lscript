@@ -22,11 +22,28 @@ UBOOT_PROMPT_PATTERN = re.compile(r"(?:^|\n)\s*=>\s*$", re.MULTILINE)
 MAC_SAVE_SUCCESS_PATTERN = re.compile(r"Programming passed\.", re.IGNORECASE)
 SWITCH_ENV_RESET_PATTERN = re.compile(r"## Resetting to default environment", re.IGNORECASE)
 SWITCH_SAVEENV_OK_PATTERN = re.compile(r"(^|\n)OK\s*$", re.IGNORECASE | re.MULTILINE)
-PING_SUCCESS_PATTERN = re.compile(r"(?:\b1 packets transmitted,\s*1 packets received\b|(?:\b1 received\b)|bytes from)", re.IGNORECASE)
+PING_SUCCESS_PATTERN = re.compile(
+    r"(?:64 bytes from\s+10\.10\.10\.1:.*?1 packets transmitted,\s*1 packets received,\s*0% packet loss|"
+    r"1 packets transmitted,\s*1 packets received,\s*0% packet loss)",
+    re.IGNORECASE | re.DOTALL,
+)
+PING_SUCCESS_TEXT = "1 packets transmitted, 1 packets received, 0% packet loss"
 EMERGENCY_SHELL_PATTERN = re.compile(r"(?:^|\n)\s*sh-5\.2#\s*$", re.MULTILINE)
+EMERGENCY_MAINTENANCE_PATTERN = re.compile(
+    r"You are in emergency mode\..*?Press Enter for maintenance\s*\(or press Control-D to continue\):",
+    re.IGNORECASE | re.DOTALL,
+)
+NXP_CLU1_LOCKED_PATTERN = re.compile(r"CLU: DEV1: design: \[DV1_V3\.3\] \| PLL Status - Locked", re.IGNORECASE)
+NXP_CLU2_LOCKED_PATTERN = re.compile(r"CLU: DEV2: design: \[DV2_V3\.3\] \| PLL Status - Locked", re.IGNORECASE)
+NXP_SWITCH_READY_PATTERN = re.compile(r"(?:^|\n)Switch ready\s*$", re.IGNORECASE | re.MULTILINE)
+NXP_FPGA_READY_PATTERN = re.compile(r"(?:^|\n)FPGA ready\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 class ConfigError(RuntimeError):
+    pass
+
+
+class BootValidationError(RuntimeError):
     pass
 
 
@@ -146,7 +163,6 @@ class ServerConfig:
     login: str
     password: str
     image_path: str
-    image_file: str
 
 
 @dataclass(frozen=True)
@@ -156,18 +172,23 @@ class DutConfig:
     password: str
     utils_path: str
     tmp_path: str
+    image_file: str
+    em_prompt: str
 
 
 @dataclass(frozen=True)
 class SwitchConfig:
     ip: str
     prompt: str
+    image_file: str
 
 
 @dataclass(frozen=True)
 class SonicConfig:
     login: str
     password: str
+    prompt: str
+    image_file: str
 
 
 @dataclass(frozen=True)
@@ -181,7 +202,8 @@ class TimeoutConfig:
     serial_open_seconds: int
     prompt_wait_seconds: int
     boot_interrupt_seconds: int
-    first_boot_seconds: int
+    uboot_boot_seconds: int
+    emergency_boot_seconds: int
 
 
 @dataclass(frozen=True)
@@ -218,7 +240,6 @@ class AppConfig:
                 login=str(server_cfg["login"]),
                 password=str(server_cfg["password"]),
                 image_path=str(server_cfg["image_path"]),
-                image_file=str(server_cfg.get("image_file", "deploy-lsbb-1.1.1-20260324.sh")),
             ),
             dut=DutConfig(
                 final_ip=str(dut_cfg["final_ip"]),
@@ -226,14 +247,19 @@ class AppConfig:
                 password=str(dut_cfg["password"]),
                 utils_path=str(dut_cfg["utils_path"]),
                 tmp_path=str(dut_cfg["tmp_path"]),
+                image_file=str(dut_cfg.get("image_file", "deploy-lsbb-1.1.1-20260324.sh")),
+                em_prompt=str(dut_cfg.get("em_prompt", "sh-5.2#")),
             ),
             switch=SwitchConfig(
                 ip=str(switch_cfg["ip"]),
                 prompt=str(switch_cfg["prompt"]),
+                image_file=str(switch_cfg.get("image_file", "telesat_lsbb-r0.itb")),
             ),
             sonic=SonicConfig(
                 login=str(sonic_cfg["login"]),
                 password=str(sonic_cfg["password"]),
+                prompt=str(sonic_cfg.get("prompt", "admin@sonic:~$")),
+                image_file=str(sonic_cfg.get("image_file", "sonic-marvell-arm64.bin")),
             ),
             prompts=PromptConfig(
                 u_boot=str(prompts_cfg["u_boot"]),
@@ -243,7 +269,8 @@ class AppConfig:
                 serial_open_seconds=int(timeouts_cfg["serial_open_seconds"]),
                 prompt_wait_seconds=int(timeouts_cfg["prompt_wait_seconds"]),
                 boot_interrupt_seconds=int(timeouts_cfg["boot_interrupt_seconds"]),
-                first_boot_seconds=int(timeouts_cfg["first_boot_seconds"]),
+                uboot_boot_seconds=int(timeouts_cfg.get("uboot_boot_seconds", timeouts_cfg.get("first_boot_seconds", 300))),
+                emergency_boot_seconds=int(timeouts_cfg.get("emergency_boot_seconds", max(int(timeouts_cfg.get("first_boot_seconds", 300)) * 2, 600))),
             ),
         )
 
@@ -331,6 +358,10 @@ class SerialSession:
         self.log_file.write(b"\n[TX] " + data + b"\n")
         self.log_file.flush()
 
+    def log_event(self, level: str, message: str) -> None:
+        self.log_file.write(f"\n[{level}] {message}\n".encode("utf-8", errors="replace"))
+        self.log_file.flush()
+
     def send_line(self, text: str) -> None:
         self.write(text.encode("utf-8") + b"\r")
 
@@ -412,6 +443,63 @@ def run_command_capture(
     return session.buffer[start_pos:]
 
 
+def run_command_wait_text(
+    session: SerialSession,
+    command: str,
+    expected_text: str,
+    timeout: int,
+    description: str | None = None,
+) -> str:
+    if description:
+        info(f"{session.name}: {description}")
+    start_pos = len(session.buffer)
+    session.send_line(command)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        session.poll()
+        segment = session.buffer[start_pos:]
+        if expected_text in segment:
+            return segment
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for command completion for: {command} on {session.name} ({session.config.port})")
+    return session.buffer[start_pos:]
+
+
+def run_command_wait_pattern(
+    session: SerialSession,
+    command: str,
+    expected_pattern: re.Pattern[str],
+    timeout: int,
+    description: str | None = None,
+) -> str:
+    if description:
+        info(f"{session.name}: {description}")
+    start_pos = len(session.buffer)
+    session.send_line(command)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        session.poll()
+        segment = session.buffer[start_pos:]
+        if expected_pattern.search(segment):
+            return segment
+        time.sleep(0.05)
+    raise TimeoutError(f"Timed out waiting for command completion for: {command} on {session.name} ({session.config.port})")
+
+
+def run_ping_check(session: SerialSession, command: str, success_text: str, prompt_text: str, timeout: int, description: str | None = None) -> str:
+    if description:
+        info(f"{session.name}: {description}")
+    start_pos = len(session.buffer)
+    session.send_line(command)
+    session.wait_for_pattern(
+        re.compile(re.escape(success_text)),
+        timeout=timeout,
+        label=f"ping success for: {command}",
+        start_pos=start_pos,
+    )
+    return session.buffer[start_pos:]
+
+
 def run_command_with_optional_password(
     session: SerialSession,
     command: str,
@@ -463,6 +551,7 @@ def run_scp_download(
 ) -> None:
     recursive_flag = "-r " if recursive else ""
     command = f"scp {recursive_flag}{server_login}@{server_ip}:{remote_path} {destination}"
+    session.log_event("INFO", f"Starting SCP download: {remote_path} -> {destination}")
     run_command_with_optional_password(
         session=session,
         command=command,
@@ -470,6 +559,7 @@ def run_scp_download(
         timeout=timeout,
         password=server_password,
     )
+    session.log_event("INFO", f"Completed SCP download: {remote_path} -> {destination}")
 
 
 def ensure_linux_shell(
@@ -509,6 +599,30 @@ def ensure_emergency_shell(session: SerialSession, boot_timeout: int, fresh: boo
     )
 
 
+def ensure_emergency_maintenance_prompt(session: SerialSession, boot_timeout: int, fresh: bool = False) -> None:
+    start_pos = len(session.buffer) if fresh else None
+    session.wait_for_pattern(
+        EMERGENCY_MAINTENANCE_PATTERN,
+        timeout=boot_timeout,
+        label="emergency maintenance prompt",
+        start_pos=start_pos,
+    )
+
+
+def validate_nxp_boot_markers(session: SerialSession) -> None:
+    checks = [
+        ("CLU DEV1 locked", NXP_CLU1_LOCKED_PATTERN),
+        ("CLU DEV2 locked", NXP_CLU2_LOCKED_PATTERN),
+        ("Switch ready", NXP_SWITCH_READY_PATTERN),
+        ("FPGA ready", NXP_FPGA_READY_PATTERN),
+    ]
+    missing = [label for label, pattern in checks if not pattern.search(session.buffer)]
+    if missing:
+        message = "NXP boot validation failed; missing: " + ", ".join(missing)
+        session.log_event("ERROR", message)
+        raise BootValidationError(message)
+
+
 def detect_nxp_uboot(
     session: SerialSession,
     autoboot_wait_timeout: int,
@@ -528,6 +642,7 @@ def detect_nxp_uboot(
                 timeout=0.25,
                 label="U-Boot prompt",
             )
+            validate_nxp_boot_markers(session)
             return
         except TimeoutError:
             time.sleep(0.15)
@@ -539,6 +654,7 @@ def detect_nxp_uboot(
         timeout=prompt_timeout,
         label="U-Boot prompt",
     )
+    validate_nxp_boot_markers(session)
 
 
 def detect_switch_prompt(
@@ -580,6 +696,7 @@ def monitor_boot_parallel(
         if nxp_interrupting and not nxp_captured:
             nxp.write(stop_key)
             if UBOOT_PROMPT_PATTERN.search(nxp.buffer):
+                validate_nxp_boot_markers(nxp)
                 nxp_captured = True
                 nxp_interrupting = False
             elif time.monotonic() > interrupt_deadline:
@@ -641,9 +758,9 @@ def build_provision_args(config: AppConfig, args: argparse.Namespace) -> Provisi
         nxp_mac3="00:04:9F:08:44:A4",
         switch_uboot_mac=normalize_mac(args.switch_uboot_mac or mac_plus(base_mac, 1)),
         switch_onie_mac=normalize_mac(args.switch_onie_mac or mac_plus(base_mac, 1)),
-        deploy_script=args.deploy_script or config.server.image_file,
-        switch_image=args.switch_image,
-        switch_itb=args.switch_itb,
+        deploy_script=args.deploy_script or config.dut.image_file,
+        switch_image=args.switch_image or config.sonic.image_file,
+        switch_itb=args.switch_itb or config.switch.image_file,
         skip_utils=bool(args.skip_utils),
     )
 
@@ -724,18 +841,27 @@ def burn_switch_uboot_mac(session: SerialSession, prompt_pattern: re.Pattern[str
 
 
 def configure_emergency_linux(session: SerialSession, config: AppConfig, provision: ProvisionArgs) -> None:
-    shell = EMERGENCY_SHELL_PATTERN
-    ensure_emergency_shell(session, config.timeouts.first_boot_seconds, fresh=True)
-    run_command(session, f"ifconfig eth0 {config.dut.final_ip}", shell, config.timeouts.prompt_wait_seconds, "Configure DUT emergency IP")
-    ping_output = run_command_capture(
+    emergency_prompt_text = config.dut.em_prompt.rstrip() + " "
+    emergency_wait_timeout = config.timeouts.emergency_boot_seconds
+    ensure_emergency_maintenance_prompt(session, emergency_wait_timeout, fresh=True)
+    info("NXP: emergency maintenance prompt detected, sending Enter")
+    session.send_line("")
+    run_command_wait_text(session, "", emergency_prompt_text, emergency_wait_timeout, "Wait for emergency shell prompt")
+    info("NXP: Configure DUT emergency IP")
+    session.send_line(f"ifconfig eth0 {config.dut.final_ip}")
+    time.sleep(0.5)
+    ping_output = run_ping_check(
         session,
-        f"ping -c 1 {config.server.ip}",
-        shell,
-        config.timeouts.prompt_wait_seconds,
+        f"ping {config.server.ip} -c1",
+        PING_SUCCESS_TEXT,
+        emergency_prompt_text,
+        max(config.timeouts.prompt_wait_seconds, 60),
         "Verify DUT can reach the image server",
     )
     if not PING_SUCCESS_PATTERN.search(ping_output):
+        session.log_event("ERROR", f"Ping to {config.server.ip} failed; stopping before SCP.")
         raise RuntimeError(f"Ping to {config.server.ip} failed; stopping before SCP.")
+    time.sleep(1)
     run_scp_download(
         session=session,
         server_login=config.server.login,
@@ -743,31 +869,33 @@ def configure_emergency_linux(session: SerialSession, config: AppConfig, provisi
         server_password=config.server.password,
         remote_path=remote_server_path(config.server, provision.deploy_script),
         destination=f"/{config.dut.tmp_path}",
-        shell_prompt=shell,
-        timeout=max(config.timeouts.first_boot_seconds, 120),
+        shell_prompt=re.compile(re.escape(emergency_prompt_text)),
+        timeout=max(config.timeouts.emergency_boot_seconds, 120),
     )
-    run_command(session, f"cd /{config.dut.tmp_path}", shell, config.timeouts.prompt_wait_seconds, "Change to the temporary directory")
-    ls_output = run_command_capture(
+    run_command_wait_text(session, f"cd /{config.dut.tmp_path}", emergency_prompt_text, config.timeouts.prompt_wait_seconds, "Change to the temporary directory")
+    ls_output = run_command_wait_text(
         session,
         "ls -all",
-        shell,
+        emergency_prompt_text,
         config.timeouts.prompt_wait_seconds,
         "List the temporary directory",
     )
     if provision.deploy_script not in ls_output:
+        session.log_event("ERROR", f"Expected {provision.deploy_script} in /{config.dut.tmp_path}, but it was not listed after SCP.")
         raise RuntimeError(f"Expected {provision.deploy_script} in /{config.dut.tmp_path}, but it was not listed after SCP.")
-    run_command(
+    session.log_event("INFO", f"Verified uploaded image in /{config.dut.tmp_path}: {provision.deploy_script}")
+    run_command_wait_text(
         session,
         f"sh ./{provision.deploy_script}",
-        shell,
-        max(config.timeouts.first_boot_seconds * 4, 600),
+        emergency_prompt_text,
+        max(config.timeouts.emergency_boot_seconds * 4, 600),
         "Run the LSBB deploy script",
     )
 
 
 def configure_installed_linux(session: SerialSession, config: AppConfig) -> None:
     shell = ROOT_SHELL_PATTERN
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.first_boot_seconds, fresh=True)
+    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
     run_command(
         session,
         "nmcli con add type ethernet ifname fm1-mac5 con-name fm1-mac5-static ipv4.addresses "
@@ -788,7 +916,7 @@ def configure_installed_linux(session: SerialSession, config: AppConfig) -> None
 
 def stage_switch_images(session: SerialSession, config: AppConfig, provision: ProvisionArgs) -> None:
     shell = ROOT_SHELL_PATTERN
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.first_boot_seconds, fresh=True)
+    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
     run_scp_download(
         session=session,
         server_login=config.server.login,
@@ -797,7 +925,7 @@ def stage_switch_images(session: SerialSession, config: AppConfig, provision: Pr
         remote_path=remote_server_path(config.server, provision.switch_image),
         destination=f"/{config.dut.tmp_path}",
         shell_prompt=shell,
-        timeout=max(config.timeouts.first_boot_seconds, 120),
+        timeout=max(config.timeouts.emergency_boot_seconds, 120),
     )
     run_scp_download(
         session=session,
@@ -807,7 +935,7 @@ def stage_switch_images(session: SerialSession, config: AppConfig, provision: Pr
         remote_path=remote_server_path(config.server, provision.switch_itb),
         destination=f"/{config.dut.tmp_path}",
         shell_prompt=shell,
-        timeout=max(config.timeouts.first_boot_seconds, 120),
+        timeout=max(config.timeouts.emergency_boot_seconds, 120),
     )
     run_command(
         session,
@@ -838,7 +966,7 @@ def install_switch_image(session: SerialSession, prompt_pattern: re.Pattern[str]
         "bootm $onie_loadaddr",
     ]
     for command in commands:
-        run_command(session, command, prompt_pattern, max(config.timeouts.first_boot_seconds, 30), description=f"Switch install: {command}")
+        run_command(session, command, prompt_pattern, max(config.timeouts.uboot_boot_seconds, 30), description=f"Switch install: {command}")
 
 
 def reset_switch_from_nxp(session: SerialSession, timeout: int) -> None:
@@ -848,7 +976,7 @@ def reset_switch_from_nxp(session: SerialSession, timeout: int) -> None:
 
 def configure_sonic(session: SerialSession, config: AppConfig) -> None:
     shell = USER_SHELL_PATTERN
-    ensure_linux_shell(session, config.sonic.login, config.sonic.password, shell, config.timeouts.first_boot_seconds, fresh=True)
+    ensure_linux_shell(session, config.sonic.login, config.sonic.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
     commands = [
         "sudo sonic-cfggen -w -j /usr/share/sonic/device/arm64-telesat_lsbb-r0/telesat-lsbb/default_config.json",
         "sudo config qos reload",
@@ -861,7 +989,7 @@ def configure_sonic(session: SerialSession, config: AppConfig) -> None:
             session=session,
             command=command,
             shell_prompt=shell,
-            timeout=max(config.timeouts.first_boot_seconds, 60),
+            timeout=max(config.timeouts.emergency_boot_seconds, 60),
             password=config.sonic.password,
         )
 
@@ -871,7 +999,7 @@ def copy_utils_and_run(session: SerialSession, config: AppConfig) -> None:
         return
 
     shell = ROOT_SHELL_PATTERN
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.first_boot_seconds)
+    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds)
     run_scp_download(
         session=session,
         server_login=config.server.login,
@@ -880,13 +1008,13 @@ def copy_utils_and_run(session: SerialSession, config: AppConfig) -> None:
         remote_path=f"/home/{config.server.login}/{config.dut.utils_path}",
         destination="/root/",
         shell_prompt=shell,
-        timeout=max(config.timeouts.first_boot_seconds, 120),
+        timeout=max(config.timeouts.emergency_boot_seconds, 120),
         recursive=True,
     )
     manual_pause("Connect the ATE PC Ethernet debug port to the DUT, then press the DUT reboot button.")
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.first_boot_seconds, fresh=True)
+    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
     run_command(session, f"cd /root/{config.dut.utils_path}", shell, config.timeouts.prompt_wait_seconds, "Change to the LSBB_Utils directory")
-    run_command(session, "sh ./run.sh", shell, max(config.timeouts.first_boot_seconds * 4, 600), "Run the LSBB_Utils test suite")
+    run_command(session, "sh ./run.sh", shell, max(config.timeouts.emergency_boot_seconds * 4, 600), "Run the LSBB_Utils test suite")
 
 
 def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: pathlib.Path) -> int:
@@ -906,7 +1034,7 @@ def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: path
             if args.skip_switch:
                 detect_nxp_uboot(
                     session=nxp,
-                    autoboot_wait_timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+                    autoboot_wait_timeout=max(config.timeouts.uboot_boot_seconds, config.timeouts.boot_interrupt_seconds),
                     prompt_timeout=config.timeouts.prompt_wait_seconds,
                     stop_key=boot_stop_bytes(args.boot_stop_key),
                 )
@@ -918,7 +1046,7 @@ def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: path
                 switch=switch,
                 switch_prompt_text=config.prompts.switch,
                 stop_key=boot_stop_bytes(args.boot_stop_key),
-                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+                timeout=max(config.timeouts.uboot_boot_seconds, config.timeouts.boot_interrupt_seconds),
             )
             if not nxp_ready:
                 raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
@@ -955,7 +1083,7 @@ def run_mac_only_mode(config: AppConfig, args: argparse.Namespace, repo_root: pa
                 switch=switch,
                 switch_prompt_text=config.prompts.switch,
                 stop_key=boot_stop_bytes(args.boot_stop_key),
-                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+                timeout=max(config.timeouts.uboot_boot_seconds, config.timeouts.boot_interrupt_seconds),
             )
             if not nxp_ready:
                 raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
@@ -999,7 +1127,7 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
                 switch=switch,
                 switch_prompt_text=config.prompts.switch,
                 stop_key=boot_stop_bytes(args.boot_stop_key),
-                timeout=max(config.timeouts.first_boot_seconds, config.timeouts.boot_interrupt_seconds),
+                timeout=max(config.timeouts.uboot_boot_seconds, config.timeouts.boot_interrupt_seconds),
             )
             if not nxp_ready:
                 raise TimeoutError(f"Timed out waiting for NXP U-Boot on {config.nxp.port}")
@@ -1021,7 +1149,7 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
             stage_switch_images(nxp, config, provision)
 
             info("Waiting for the switch U-Boot prompt again before ONIE image install")
-            switch_prompt = detect_switch_prompt(switch, config.prompts.switch, config.timeouts.first_boot_seconds)
+            switch_prompt = detect_switch_prompt(switch, config.prompts.switch, config.timeouts.uboot_boot_seconds)
             install_switch_image(switch, switch_prompt, config, provision)
 
             reset_switch_from_nxp(nxp, config.timeouts.prompt_wait_seconds)
