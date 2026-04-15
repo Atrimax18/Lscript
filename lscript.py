@@ -15,11 +15,13 @@ import serial
 AUTOBOOT_PATTERN = re.compile(r"Hit any key to stop autoboot:", re.IGNORECASE)
 LOGIN_PATTERN = re.compile(r"(?:^|\n).{0,40}login:\s*$", re.IGNORECASE | re.MULTILINE)
 PASSWORD_PATTERN = re.compile(r"(?:^|\n).{0,80}password(?: for [^:]+)?:\s*$", re.IGNORECASE | re.MULTILINE)
-HOST_KEY_CONFIRM_PATTERN = re.compile(r"are you sure you want to continue connecting", re.IGNORECASE)
+HOST_KEY_CONFIRM_YES_PATTERN = re.compile(r"are you sure you want to continue connecting", re.IGNORECASE)
+HOST_KEY_CONFIRM_Y_PATTERN = re.compile(r"do you want to continue connecting\?\s*\(y/n\)", re.IGNORECASE)
 ROOT_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}#\s*$", re.MULTILINE)
 USER_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}(?:\$|>)\s*$", re.MULTILINE)
 UBOOT_PROMPT_PATTERN = re.compile(r"(?:^|\n)\s*=>\s*$", re.MULTILINE)
 MAC_SAVE_SUCCESS_PATTERN = re.compile(r"Programming passed\.", re.IGNORECASE)
+SONIC_SYSTEM_READY_PATTERN = re.compile(r"System is ready", re.IGNORECASE)
 SWITCH_ENV_RESET_PATTERN = re.compile(r"## Resetting to default environment", re.IGNORECASE)
 SWITCH_SAVEENV_OK_PATTERN = re.compile(r"(^|\n)OK\s*$", re.IGNORECASE | re.MULTILINE)
 PING_SUCCESS_PATTERN = re.compile(
@@ -374,7 +376,6 @@ class SerialSession:
         self.log_file.flush()
         text = data.decode("utf-8", errors="replace")
         self.buffer += text
-        self.buffer = self.buffer[-16000:]
         return text
 
     def wait_for_pattern(
@@ -486,7 +487,7 @@ def run_command_wait_pattern(
     raise TimeoutError(f"Timed out waiting for command completion for: {command} on {session.name} ({session.config.port})")
 
 
-def run_ping_check(session: SerialSession, command: str, success_text: str, prompt_text: str, timeout: int, description: str | None = None) -> str:
+def run_ping_check(session: SerialSession, command: str, success_text: str, timeout: int, description: str | None = None) -> str:
     if description:
         info(f"{session.name}: {description}")
     start_pos = len(session.buffer)
@@ -512,7 +513,8 @@ def run_command_with_optional_password(
     session.send_line(command)
     result = session.wait_for_any_pattern(
         {
-            "hostkey": HOST_KEY_CONFIRM_PATTERN,
+            "hostkey_yes": HOST_KEY_CONFIRM_YES_PATTERN,
+            "hostkey_y": HOST_KEY_CONFIRM_Y_PATTERN,
             "password": password_prompt,
             "shell": shell_prompt,
         },
@@ -520,9 +522,11 @@ def run_command_with_optional_password(
         label=f"command completion for: {command}",
         start_pos=start_pos,
     )
-    if result == "hostkey":
+    if result in {"hostkey_yes", "hostkey_y"}:
         start_pos = len(session.buffer)
-        session.send_line("yes")
+        hostkey_answer = "yes" if result == "hostkey_yes" else "y"
+        session.log_event("INFO", f"Host key confirmation detected; sending {hostkey_answer!r}.")
+        session.send_line(hostkey_answer)
         result = session.wait_for_any_pattern(
             {
                 "password": password_prompt,
@@ -534,6 +538,7 @@ def run_command_with_optional_password(
         )
     if result == "password":
         start_pos = len(session.buffer)
+        session.log_event("INFO", "Password prompt detected; sending configured password.")
         session.send_line(password)
         session.wait_for_pattern(shell_prompt, timeout=timeout, label=f"shell after password for: {command}", start_pos=start_pos)
 
@@ -587,6 +592,43 @@ def ensure_linux_shell(
         start_pos = len(session.buffer)
         session.send_line(password)
         session.wait_for_pattern(shell_prompt, timeout=boot_timeout, label="linux shell", start_pos=start_pos)
+
+
+def ensure_sonic_shell(session: SerialSession, config: AppConfig, shell_prompt: re.Pattern[str]) -> None:
+    boot_timeout = max(config.timeouts.emergency_boot_seconds, config.timeouts.first_boot_seconds)
+    start_pos = len(session.buffer)
+    session.wait_for_pattern(
+        SONIC_SYSTEM_READY_PATTERN,
+        timeout=boot_timeout,
+        label="SONiC system ready",
+        start_pos=start_pos,
+    )
+    session.log_event("INFO", "SONiC system ready detected; sending Enter twice before login.")
+
+    start_pos = len(session.buffer)
+    session.send_line("")
+    session.send_line("")
+    result = session.wait_for_any_pattern(
+        {
+            "login": LOGIN_PATTERN,
+            "shell": shell_prompt,
+        },
+        timeout=config.timeouts.prompt_wait_seconds,
+        label="SONiC login prompt after Enter twice",
+        start_pos=start_pos,
+    )
+    if result == "shell":
+        return
+
+    start_pos = len(session.buffer)
+    session.log_event("INFO", f"SONiC login prompt detected; sending username from YAML: {config.sonic.login}.")
+    session.send_line(config.sonic.login)
+    session.wait_for_pattern(PASSWORD_PATTERN, timeout=30, label="SONiC password prompt", start_pos=start_pos)
+
+    start_pos = len(session.buffer)
+    session.log_event("INFO", "SONiC password prompt detected; sending password from YAML.")
+    session.send_line(config.sonic.password)
+    session.wait_for_pattern(shell_prompt, timeout=boot_timeout, label="SONiC shell prompt", start_pos=start_pos)
 
 
 def ensure_emergency_shell(session: SerialSession, boot_timeout: int, fresh: bool = False) -> None:
@@ -846,21 +888,38 @@ def configure_emergency_linux(session: SerialSession, config: AppConfig, provisi
     ensure_emergency_maintenance_prompt(session, emergency_wait_timeout, fresh=True)
     info("NXP: emergency maintenance prompt detected, sending Enter")
     session.send_line("")
-    run_command_wait_text(session, "", emergency_prompt_text, emergency_wait_timeout, "Wait for emergency shell prompt")
-    info("NXP: Configure DUT emergency IP")
-    session.send_line(f"ifconfig eth0 {config.dut.final_ip}")
-    time.sleep(0.5)
-    ping_output = run_ping_check(
+    ensure_emergency_shell(session, emergency_wait_timeout, fresh=False)
+    network_check_command = f"ifconfig eth0 {config.dut.final_ip} ; ping {config.server.ip} -c1"
+    info(f"NXP: Configure DUT IP and verify server reachability: {network_check_command}")
+    session.log_event("INFO", f"Starting network check: {network_check_command}")
+    ping_output = run_command_wait_text(
         session,
-        f"ping {config.server.ip} -c1",
+        network_check_command,
         PING_SUCCESS_TEXT,
-        emergency_prompt_text,
-        max(config.timeouts.prompt_wait_seconds, 60),
-        "Verify DUT can reach the image server",
+        max(config.timeouts.prompt_wait_seconds, 90),
+        "Configure DUT IP and verify image server reachability",
     )
     if not PING_SUCCESS_PATTERN.search(ping_output):
         session.log_event("ERROR", f"Ping to {config.server.ip} failed; stopping before SCP.")
         raise RuntimeError(f"Ping to {config.server.ip} failed; stopping before SCP.")
+    ok("Ping success detected, starting SCP")
+    session.log_event("INFO", f"Ping success detected, starting SCP to /{config.dut.tmp_path}")
+    start_pos = len(session.buffer)
+    session.send_line("")
+    session.wait_for_pattern(
+        re.compile(re.escape(emergency_prompt_text)),
+        timeout=config.timeouts.prompt_wait_seconds,
+        label="emergency shell prompt after first Enter",
+        start_pos=start_pos,
+    )
+    start_pos = len(session.buffer)
+    session.send_line("")
+    session.wait_for_pattern(
+        re.compile(re.escape(emergency_prompt_text)),
+        timeout=config.timeouts.prompt_wait_seconds,
+        label="emergency shell prompt after second Enter",
+        start_pos=start_pos,
+    )
     time.sleep(1)
     run_scp_download(
         session=session,
@@ -914,7 +973,12 @@ def configure_installed_linux(session: SerialSession, config: AppConfig) -> None
     )
 
 
-def stage_switch_images(session: SerialSession, config: AppConfig, provision: ProvisionArgs) -> None:
+def stage_switch_images(
+    session: SerialSession,
+    switch_session: SerialSession,
+    config: AppConfig,
+    provision: ProvisionArgs,
+) -> re.Pattern[str]:
     shell = ROOT_SHELL_PATTERN
     ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
     run_scp_download(
@@ -947,13 +1011,21 @@ def stage_switch_images(session: SerialSession, config: AppConfig, provision: Pr
     )
     run_command(session, "nmcli con up fm1-mac10-static", shell, config.timeouts.prompt_wait_seconds, "Bring up the NXP-to-switch connection")
     run_command(session, "nmcli con show", shell, config.timeouts.prompt_wait_seconds, "Show active NetworkManager connections")
-    run_command(session, f"ping -c 1 {config.switch.ip}", shell, config.timeouts.prompt_wait_seconds, "Probe the switch management address")
+    switch_prompt = detect_switch_prompt(switch_session, config.prompts.switch, config.timeouts.uboot_boot_seconds)
+    run_command(
+        switch_session,
+        "ping $serverip",
+        switch_prompt,
+        config.timeouts.prompt_wait_seconds,
+        "Switch U-Boot: probe serverip from COM21",
+    )
     run_command(session, f"cd /{config.dut.tmp_path}", shell, config.timeouts.prompt_wait_seconds, "Change to the temporary directory")
     run_command(session, "ps -ef | grep udpsvd", shell, config.timeouts.prompt_wait_seconds, "Check whether TFTP is already running")
     run_command(session, "ps -ef | grep httpserv", shell, config.timeouts.prompt_wait_seconds, "Check whether HTTP is already running")
     run_command(session, "busybox udpsvd -vE 0.0.0.0 69 tftpd . &", shell, config.timeouts.prompt_wait_seconds, "Start the TFTP server")
     run_command(session, "ps -ef | grep udpsvd", shell, config.timeouts.prompt_wait_seconds, "Confirm the TFTP server is active")
     run_command(session, "httpserv -p 80 &", shell, config.timeouts.prompt_wait_seconds, "Start the HTTP server")
+    return switch_prompt
 
 
 def install_switch_image(session: SerialSession, prompt_pattern: re.Pattern[str], config: AppConfig, provision: ProvisionArgs) -> None:
@@ -963,10 +1035,12 @@ def install_switch_image(session: SerialSession, prompt_pattern: re.Pattern[str]
         "saveenv",
         "tftpboot $onie_loadaddr $onie_image_name",
         "run onie_bootargs",
-        "bootm $onie_loadaddr",
     ]
     for command in commands:
         run_command(session, command, prompt_pattern, max(config.timeouts.uboot_boot_seconds, 30), description=f"Switch install: {command}")
+    info("Switch install: bootm $onie_loadaddr")
+    session.log_event("INFO", "Switch install: bootm $onie_loadaddr")
+    session.send_line("bootm $onie_loadaddr")
 
 
 def reset_switch_from_nxp(session: SerialSession, timeout: int) -> None:
@@ -975,8 +1049,8 @@ def reset_switch_from_nxp(session: SerialSession, timeout: int) -> None:
 
 
 def configure_sonic(session: SerialSession, config: AppConfig) -> None:
-    shell = USER_SHELL_PATTERN
-    ensure_linux_shell(session, config.sonic.login, config.sonic.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
+    shell = re.compile(re.escape(config.sonic.prompt))
+    ensure_sonic_shell(session, config, shell)
     commands = [
         "sudo sonic-cfggen -w -j /usr/share/sonic/device/arm64-telesat_lsbb-r0/telesat-lsbb/default_config.json",
         "sudo config qos reload",
@@ -1146,13 +1220,11 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
             configure_installed_linux(nxp, config)
 
             manual_pause("Press the DUT reboot button again so the saved network configuration is active.")
-            stage_switch_images(nxp, config, provision)
+            switch_prompt = stage_switch_images(nxp, switch, config, provision)
 
-            info("Waiting for the switch U-Boot prompt again before ONIE image install")
-            switch_prompt = detect_switch_prompt(switch, config.prompts.switch, config.timeouts.uboot_boot_seconds)
+            info("Switch U-Boot serverip probe completed; starting ONIE image install")
             install_switch_image(switch, switch_prompt, config, provision)
 
-            reset_switch_from_nxp(nxp, config.timeouts.prompt_wait_seconds)
             configure_sonic(switch, config)
 
             if not provision.skip_utils:

@@ -2,7 +2,7 @@
 
 Windows-driven serial automation for the LSBB lab flow.
 
-The script now supports two modes:
+The script now supports three modes:
 
 - `detect`: stop NXP autoboot on `COM20` and confirm the switch `Telesat>>` prompt on `COM21`
 - `mac-only`: stop both sides in U-Boot, program NXP and switch MACs, and stop there
@@ -99,15 +99,29 @@ python .\lscript.py --mode provision `
 - Writes fixed NXP values to `mac 1`, `mac 2`, and `mac 3`
 - Burns the switch U-Boot MAC with `setenv ethaddr` using `base-mac + 1`
 - Pauses for the physical DUT reset into emergency Linux, waits for the maintenance message, and then waits for the `sh-5.2#` prompt on the NXP terminal
-- Configures DUT IP, verifies `ping` to the image server, pulls the deploy script, verifies it appears in `/tmp`, and only then runs it
+- Configures DUT IP and verifies image-server reachability with one combined emergency command:
+  `ifconfig eth0 10.10.10.2 ; ping 10.10.10.1 -c1`
+- Continues only after detecting:
+  `1 packets transmitted, 1 packets received, 0% packet loss`
+- Sends Enter twice after successful emergency ping, then starts SCP
+- Pulls the deploy script from the server path built from YAML, for example:
+  `scp deploy@10.10.10.1:/home/deploy/images/deploy-lsbb-1.1.1-20260324.sh /tmp`
+- Handles SCP first-connect prompts by sending `y` for Dropbear-style host-key confirmation and then sends `server.password` from YAML
+- Verifies the deploy script appears in `/tmp`, and only then runs it
 - Pauses for the documented reboot steps
 - Configures persistent DUT networking with `nmcli`
 - Copies switch image files to `/tmp`
 - Configures `fm1-mac10` as `192.168.2.1/24`
+- After `nmcli con show` on the NXP terminal, switches to COM21 and sends `ping $serverip` from the switch U-Boot prompt
 - Starts the local TFTP and HTTP services on the DUT
 - Programs the switch install URL and boots the switch image
-- Resets the switch from the NXP side using `cpld w 0x45`
-- Logs into SONiC and runs the documented config commands
+- After `bootm $onie_loadaddr`, waits on COM21 for `System is ready`
+- Sends Enter twice after SONiC is ready, then logs in with `sonic.login` and `sonic.password` from YAML
+- Logs into SONiC and runs the documented config commands:
+  `sudo sonic-cfggen -w -j /usr/share/sonic/device/arm64-telesat_lsbb-r0/telesat-lsbb/default_config.json`
+  `sudo config qos reload`
+  `sudo config interface ip add eth0 192.168.2.2/24`
+  `sudo config save -y`
 - Copies `LSBB_Utils` and runs `run.sh` unless `--skip-utils` is used
 
 ## Manual Intervention Points
