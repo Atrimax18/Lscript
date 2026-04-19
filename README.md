@@ -6,7 +6,7 @@ The script now supports three modes:
 
 - `detect`: stop NXP autoboot on `COM20` and confirm the switch `Telesat>>` prompt on `COM21`
 - `mac-only`: stop both sides in U-Boot, program NXP and switch MACs, and stop there
-- `provision`: run the documented flow from MAC programming through Linux install, switch image install, SONiC setup, and `LSBB_Utils`
+- `provision`: run the documented flow from MAC programming through Linux install, switch image install, SONiC setup, and `LSBB_Utils` copy
 
 Serial logs are saved under `logs/`, and both `COM20` and `COM21` are opened and logged from the start of the run.
 
@@ -79,9 +79,11 @@ Timeouts are now separated in YAML:
 - `timeouts.uboot_boot_seconds` for the U-Boot capture phase
 - `timeouts.emergency_boot_seconds` for the reboot into emergency Linux
 
-`timeouts.first_boot_seconds` is still accepted as a fallback for older configs.
+`timeouts.first_boot_seconds` is kept as a legacy timeout value.
 
-To skip the final `LSBB_Utils` copy and run:
+`timeouts.sonic_boot_seconds` controls the operator-visible SONiC first-boot wait after the NXP reset pulse.
+
+To skip the final `LSBB_Utils` copy:
 
 ```powershell
 python .\lscript.py --mode provision `
@@ -108,30 +110,45 @@ python .\lscript.py --mode provision `
   `scp deploy@10.10.10.1:/home/deploy/images/deploy-lsbb-1.1.1-20260324.sh /tmp`
 - Handles SCP first-connect prompts by sending `y` for Dropbear-style host-key confirmation and then sends `server.password` from YAML
 - Verifies the deploy script appears in `/tmp`, and only then runs it
-- Pauses for the documented reboot steps
+- Pauses for the documented reset-button steps
 - Configures persistent DUT networking with `nmcli`
+- After `nmcli con mod fm1-mac5-static connection.autoconnect yes`, waits 2 seconds, sends Enter twice, and only then shows the next reset-button action
 - Copies switch image files to `/tmp`
 - Configures `fm1-mac10` as `192.168.2.1/24`
 - After `nmcli con show` on the NXP terminal, switches to COM21 and sends `ping $serverip` from the switch U-Boot prompt
 - Starts the local TFTP and HTTP services on the DUT
+- Waits 2 seconds after `httpserv -p 80 &`
 - Programs the switch install URL and boots the switch image
-- After `bootm $onie_loadaddr`, waits on COM21 for `System is ready`
-- Sends Enter twice after SONiC is ready, then logs in with `sonic.login` and `sonic.password` from YAML
+- After `bootm $onie_loadaddr`, waits on COM21 for the reboot-request message
+- Waits 5 seconds, then sends the NXP reset pulse:
+  `cd /root`
+  `cpld w 0x45 0`
+  `cpld w 0x45 3`
+- Runs the operator-visible SONiC first-boot timer from `timeouts.sonic_boot_seconds`
+- After the timer completes, sends Enter twice on COM21, waits for `sonic login:`, and logs in with `sonic.login` and `sonic.password` from YAML
 - Logs into SONiC and runs the documented config commands:
   `sudo sonic-cfggen -w -j /usr/share/sonic/device/arm64-telesat_lsbb-r0/telesat-lsbb/default_config.json`
   `sudo config qos reload`
   `sudo config interface ip add eth0 192.168.2.2/24`
   `sudo config save -y`
-- Copies `LSBB_Utils` and runs `run.sh` unless `--skip-utils` is used
+- Waits 8 seconds after each SONiC config command
+- Copies `LSBB_Utils` to `/root/` on the NXP side unless `--skip-utils` is used:
+  `scp -r deploy@10.10.10.1:/home/deploy/LSBB_Utils /root/`
+- After the copy, waits for switch `System is ready`, then runs the switch management ping:
+  `sudo ip vrf exec mgmt ping 192.168.2.1 -c1`
+- After the switch ping, runs the NXP ping:
+  `ping 192.168.2.2 -c1`
+- Stops immediately if the switch log shows bootm failures such as:
+  `Wrong Image Format for bootm command`
+  `ERROR: can't get kernel image!`
 
 ## Manual Intervention Points
 
 The procedure still requires an operator for the physical steps from the manual:
 
-- Reset the DUT after MAC programming
-- Reboot after the deploy script completes
-- Reboot after saving the persistent DUT IP configuration
-- Connect the ATE PC Ethernet debug port before the final `LSBB_Utils` run
+- Press the DUT reset button after MAC programming
+- Press the DUT reset button after the deploy script completes
+- Press the DUT reset button again after saving the persistent DUT IP configuration
 
 The script pauses at each of those points and continues when Enter is pressed.
 

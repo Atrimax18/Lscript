@@ -35,6 +35,7 @@ switch:
 sonic:
   login: admin
   password: admin
+  login_prompt: "sonic login: "
   prompt: "admin@sonic:~$"
   image_file: sonic-marvell-arm64.bin 
 
@@ -48,4 +49,5 @@ timeouts:
   boot_interrupt_seconds: 5
   uboot_boot_seconds: 300
   emergency_boot_seconds: 600
-  first_boot_seconds: 300
+  first_boot_seconds: 460
+  sonic_boot_seconds: 460

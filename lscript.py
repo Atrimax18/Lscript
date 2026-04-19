@@ -14,6 +14,7 @@ import serial
 
 AUTOBOOT_PATTERN = re.compile(r"Hit any key to stop autoboot:", re.IGNORECASE)
 LOGIN_PATTERN = re.compile(r"(?:^|\n).{0,40}login:\s*$", re.IGNORECASE | re.MULTILINE)
+SONIC_LOGIN_PATTERN = re.compile(r"(?:^|\n).{0,40}sonic login:\s*$", re.IGNORECASE | re.MULTILINE)
 PASSWORD_PATTERN = re.compile(r"(?:^|\n).{0,80}password(?: for [^:]+)?:\s*$", re.IGNORECASE | re.MULTILINE)
 HOST_KEY_CONFIRM_YES_PATTERN = re.compile(r"are you sure you want to continue connecting", re.IGNORECASE)
 HOST_KEY_CONFIRM_Y_PATTERN = re.compile(r"do you want to continue connecting\?\s*\(y/n\)", re.IGNORECASE)
@@ -21,7 +22,16 @@ ROOT_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}#\s*$", re.MULTILINE)
 USER_SHELL_PATTERN = re.compile(r"(?:^|\n).{0,120}(?:\$|>)\s*$", re.MULTILINE)
 UBOOT_PROMPT_PATTERN = re.compile(r"(?:^|\n)\s*=>\s*$", re.MULTILINE)
 MAC_SAVE_SUCCESS_PATTERN = re.compile(r"Programming passed\.", re.IGNORECASE)
-SONIC_SYSTEM_READY_PATTERN = re.compile(r"System is ready", re.IGNORECASE)
+SONIC_SYSTEM_READY_PATTERN = re.compile(
+    r"(?:^|\n)(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?System is ready\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SWITCH_GOING_DOWN_PATTERN = re.compile(r"The system is going down NOW!", re.IGNORECASE)
+SWITCH_SIGTERM_PATTERN = re.compile(r"Sent SIGTERM to all processes", re.IGNORECASE)
+SWITCH_SIGKILL_PATTERN = re.compile(r"Sent SIGKILL to all processes", re.IGNORECASE)
+SWITCH_REBOOT_REQUEST_PATTERN = re.compile(r"(?:requesting\s+)?system.*reboot|requesting.*reboot", re.IGNORECASE)
+SWITCH_BOOTM_WRONG_FORMAT_PATTERN = re.compile(r"Wrong Image Format for bootm command", re.IGNORECASE)
+SWITCH_BOOTM_KERNEL_ERROR_PATTERN = re.compile(r"ERROR:\s*can't get kernel image!", re.IGNORECASE)
 SWITCH_ENV_RESET_PATTERN = re.compile(r"## Resetting to default environment", re.IGNORECASE)
 SWITCH_SAVEENV_OK_PATTERN = re.compile(r"(^|\n)OK\s*$", re.IGNORECASE | re.MULTILINE)
 PING_SUCCESS_PATTERN = re.compile(
@@ -206,6 +216,8 @@ class TimeoutConfig:
     boot_interrupt_seconds: int
     uboot_boot_seconds: int
     emergency_boot_seconds: int
+    first_boot_seconds: int
+    sonic_boot_seconds: int
 
 
 @dataclass(frozen=True)
@@ -272,7 +284,9 @@ class AppConfig:
                 prompt_wait_seconds=int(timeouts_cfg["prompt_wait_seconds"]),
                 boot_interrupt_seconds=int(timeouts_cfg["boot_interrupt_seconds"]),
                 uboot_boot_seconds=int(timeouts_cfg.get("uboot_boot_seconds", timeouts_cfg.get("first_boot_seconds", 300))),
-                emergency_boot_seconds=int(timeouts_cfg.get("emergency_boot_seconds", max(int(timeouts_cfg.get("first_boot_seconds", 300)) * 2, 600))),
+                emergency_boot_seconds=int(timeouts_cfg.get("emergency_boot_seconds", max(int(timeouts_cfg.get("sonic_boot_seconds", timeouts_cfg.get("first_boot_seconds", 300))) * 2, 600))),
+                first_boot_seconds=int(timeouts_cfg.get("first_boot_seconds", timeouts_cfg.get("uboot_boot_seconds", 300))),
+                sonic_boot_seconds=int(timeouts_cfg.get("sonic_boot_seconds", timeouts_cfg.get("first_boot_seconds", timeouts_cfg.get("uboot_boot_seconds", 300)))),
             ),
         )
 
@@ -595,22 +609,15 @@ def ensure_linux_shell(
 
 
 def ensure_sonic_shell(session: SerialSession, config: AppConfig, shell_prompt: re.Pattern[str]) -> None:
-    boot_timeout = max(config.timeouts.emergency_boot_seconds, config.timeouts.first_boot_seconds)
-    start_pos = len(session.buffer)
-    session.wait_for_pattern(
-        SONIC_SYSTEM_READY_PATTERN,
-        timeout=boot_timeout,
-        label="SONiC system ready",
-        start_pos=start_pos,
-    )
-    session.log_event("INFO", "SONiC system ready detected; sending Enter twice before login.")
+    boot_timeout = max(config.timeouts.emergency_boot_seconds, config.timeouts.sonic_boot_seconds)
+    session.log_event("INFO", "SONiC boot timer completed; sending Enter twice and waiting for sonic login prompt.")
 
     start_pos = len(session.buffer)
     session.send_line("")
     session.send_line("")
     result = session.wait_for_any_pattern(
         {
-            "login": LOGIN_PATTERN,
+            "login": SONIC_LOGIN_PATTERN,
             "shell": shell_prompt,
         },
         timeout=config.timeouts.prompt_wait_seconds,
@@ -629,6 +636,43 @@ def ensure_sonic_shell(session: SerialSession, config: AppConfig, shell_prompt: 
     session.log_event("INFO", "SONiC password prompt detected; sending password from YAML.")
     session.send_line(config.sonic.password)
     session.wait_for_pattern(shell_prompt, timeout=boot_timeout, label="SONiC shell prompt", start_pos=start_pos)
+
+
+def wait_for_switch_reboot_request(session: SerialSession, timeout: int) -> None:
+    start_pos = len(session.buffer)
+    result = session.wait_for_any_pattern(
+        {
+            "reboot": SWITCH_REBOOT_REQUEST_PATTERN,
+            "wrong_format": SWITCH_BOOTM_WRONG_FORMAT_PATTERN,
+            "kernel_error": SWITCH_BOOTM_KERNEL_ERROR_PATTERN,
+        },
+        timeout=timeout,
+        label="switch reboot request",
+        start_pos=start_pos,
+    )
+    if result == "wrong_format":
+        message = "Switch bootm failed: Wrong Image Format for bootm command"
+        session.log_event("ERROR", message)
+        raise RuntimeError(message)
+    if result == "kernel_error":
+        message = "Switch bootm failed: ERROR: can't get kernel image!"
+        session.log_event("ERROR", message)
+        raise RuntimeError(message)
+
+
+def wait_with_operator_timer(total_seconds: int, label: str) -> None:
+    info(f"{label}: waiting about {total_seconds // 60}:{total_seconds % 60:02d}")
+    remaining = total_seconds
+    while remaining > 0:
+        chunk = 60 if remaining > 60 else remaining
+        time.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            if remaining >= 60:
+                info(f"{label}: {remaining // 60} minute(s) remaining ({remaining // 60}:{remaining % 60:02d})")
+            else:
+                info(f"{label}: {remaining} second(s) remaining (0:{remaining:02d})")
+    info(f"{label}: timer completed")
 
 
 def ensure_emergency_shell(session: SerialSession, boot_timeout: int, fresh: bool = False) -> None:
@@ -971,6 +1015,9 @@ def configure_installed_linux(session: SerialSession, config: AppConfig) -> None
         config.timeouts.prompt_wait_seconds,
         "Enable autoconnect for the DUT management connection",
     )
+    time.sleep(2)
+    run_command(session, "", shell, config.timeouts.prompt_wait_seconds, "Confirm NXP shell prompt after autoconnect change")
+    run_command(session, "", shell, config.timeouts.prompt_wait_seconds, "Confirm NXP shell prompt after second Enter")
 
 
 def stage_switch_images(
@@ -1025,6 +1072,7 @@ def stage_switch_images(
     run_command(session, "busybox udpsvd -vE 0.0.0.0 69 tftpd . &", shell, config.timeouts.prompt_wait_seconds, "Start the TFTP server")
     run_command(session, "ps -ef | grep udpsvd", shell, config.timeouts.prompt_wait_seconds, "Confirm the TFTP server is active")
     run_command(session, "httpserv -p 80 &", shell, config.timeouts.prompt_wait_seconds, "Start the HTTP server")
+    time.sleep(2)
     return switch_prompt
 
 
@@ -1044,6 +1092,7 @@ def install_switch_image(session: SerialSession, prompt_pattern: re.Pattern[str]
 
 
 def reset_switch_from_nxp(session: SerialSession, timeout: int) -> None:
+    run_command(session, "cd /root", ROOT_SHELL_PATTERN, timeout, "Return to /root before pulsing the switch reset line")
     run_command(session, "cpld w 0x45 0", ROOT_SHELL_PATTERN, timeout, "Assert the switch reset line")
     run_command(session, "cpld w 0x45 3", ROOT_SHELL_PATTERN, timeout, "Release the switch reset line")
 
@@ -1056,7 +1105,6 @@ def configure_sonic(session: SerialSession, config: AppConfig) -> None:
         "sudo config qos reload",
         f"sudo config interface ip add eth0 {config.switch.ip}/24",
         "sudo config save -y",
-        "sudo ip vrf exec mgmt ping -c 1 192.168.2.1",
     ]
     for command in commands:
         run_command_with_optional_password(
@@ -1066,6 +1114,41 @@ def configure_sonic(session: SerialSession, config: AppConfig) -> None:
             timeout=max(config.timeouts.emergency_boot_seconds, 60),
             password=config.sonic.password,
         )
+        time.sleep(8)
+    session.log_event("INFO", "Waiting for SONiC final 'System is ready' before management ping.")
+    session.wait_for_pattern(
+        SONIC_SYSTEM_READY_PATTERN,
+        timeout=max(config.timeouts.sonic_boot_seconds, 120),
+        label="SONiC final system ready after configuration",
+    )
+
+
+def verify_switch_management_ping(session: SerialSession, config: AppConfig) -> None:
+    shell = re.compile(re.escape(config.sonic.prompt))
+    session.log_event("INFO", "Waiting for switch 'System is ready' before management ping.")
+    session.wait_for_pattern(
+        SONIC_SYSTEM_READY_PATTERN,
+        timeout=max(config.timeouts.sonic_boot_seconds, 120),
+        label="switch system ready before management ping",
+    )
+    run_command_with_optional_password(
+        session=session,
+        command="sudo ip vrf exec mgmt ping 192.168.2.1 -c1",
+        shell_prompt=shell,
+        timeout=max(config.timeouts.emergency_boot_seconds, 60),
+        password=config.sonic.password,
+    )
+
+
+def verify_nxp_ping_switch(session: SerialSession, config: AppConfig) -> None:
+    ensure_linux_shell(session, config.dut.login, config.dut.password, ROOT_SHELL_PATTERN, config.timeouts.emergency_boot_seconds)
+    run_command(
+        session,
+        f"ping {config.switch.ip} -c1",
+        ROOT_SHELL_PATTERN,
+        max(config.timeouts.prompt_wait_seconds, 30),
+        "Verify NXP can reach the switch management IP",
+    )
 
 
 def copy_utils_and_run(session: SerialSession, config: AppConfig) -> None:
@@ -1085,10 +1168,6 @@ def copy_utils_and_run(session: SerialSession, config: AppConfig) -> None:
         timeout=max(config.timeouts.emergency_boot_seconds, 120),
         recursive=True,
     )
-    manual_pause("Connect the ATE PC Ethernet debug port to the DUT, then press the DUT reboot button.")
-    ensure_linux_shell(session, config.dut.login, config.dut.password, shell, config.timeouts.emergency_boot_seconds, fresh=True)
-    run_command(session, f"cd /root/{config.dut.utils_path}", shell, config.timeouts.prompt_wait_seconds, "Change to the LSBB_Utils directory")
-    run_command(session, "sh ./run.sh", shell, max(config.timeouts.emergency_boot_seconds * 4, 600), "Run the LSBB_Utils test suite")
 
 
 def run_detect_mode(config: AppConfig, args: argparse.Namespace, repo_root: pathlib.Path) -> int:
@@ -1216,21 +1295,29 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
             manual_pause("Press the DUT reset button so the system boots into emergency Linux on the NXP side.")
             configure_emergency_linux(nxp, config, provision)
 
-            manual_pause("Press the DUT reboot button after the deploy script completes.")
+            manual_pause("Press the DUT reset button after the deploy script completes.")
             configure_installed_linux(nxp, config)
 
-            manual_pause("Press the DUT reboot button again so the saved network configuration is active.")
+            manual_pause("Press the DUT reset button again so the saved network configuration is active.")
             switch_prompt = stage_switch_images(nxp, switch, config, provision)
 
             info("Switch U-Boot serverip probe completed; starting ONIE image install")
             install_switch_image(switch, switch_prompt, config, provision)
 
+            info("Waiting for switch reboot request on COM21 after bootm")
+            wait_for_switch_reboot_request(switch, 240)
+            time.sleep(5)
+            info("Switch reboot request detected; pulsing reset from NXP")
+            reset_switch_from_nxp(nxp, config.timeouts.prompt_wait_seconds)
+            wait_with_operator_timer(config.timeouts.sonic_boot_seconds, "Switch SONiC first boot")
             configure_sonic(switch, config)
 
             if not provision.skip_utils:
                 copy_utils_and_run(nxp, config)
             else:
                 warn("Skipping LSBB_Utils copy and run because --skip-utils was provided")
+            verify_switch_management_ping(switch, config)
+            verify_nxp_ping_switch(nxp, config)
     except (serial.SerialException, TimeoutError, ValueError, RuntimeError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
