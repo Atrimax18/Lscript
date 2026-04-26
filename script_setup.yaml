@@ -51,3 +51,12 @@ timeouts:
   emergency_boot_seconds: 600
   first_boot_seconds: 460
   sonic_boot_seconds: 460
+
+db:
+  type: sqlite
+  path: C:\Users\alexeyt\source\repos\DB_MAC\sn_mac_test.db
+  table: mac_table
+  serial_column: serial_number
+  mac_column_format: mac{index}
+  mac_count: 16
+  auto_create: true

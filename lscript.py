@@ -4,12 +4,18 @@ import argparse
 import datetime as dt
 import pathlib
 import re
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import serial
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 AUTOBOOT_PATTERN = re.compile(r"Hit any key to stop autoboot:", re.IGNORECASE)
@@ -26,6 +32,7 @@ SONIC_SYSTEM_READY_PATTERN = re.compile(
     r"(?:^|\n)(?:[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?System is ready\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+NXP_REBOOT_TRANSITION_PATTERN = re.compile(r"(?:reboot: Restarting system|NOTICE:|ls1046afrwy login:)", re.IGNORECASE)
 SWITCH_GOING_DOWN_PATTERN = re.compile(r"The system is going down NOW!", re.IGNORECASE)
 SWITCH_SIGTERM_PATTERN = re.compile(r"Sent SIGTERM to all processes", re.IGNORECASE)
 SWITCH_SIGKILL_PATTERN = re.compile(r"Sent SIGKILL to all processes", re.IGNORECASE)
@@ -49,6 +56,8 @@ NXP_CLU1_LOCKED_PATTERN = re.compile(r"CLU: DEV1: design: \[DV1_V3\.3\] \| PLL S
 NXP_CLU2_LOCKED_PATTERN = re.compile(r"CLU: DEV2: design: \[DV2_V3\.3\] \| PLL Status - Locked", re.IGNORECASE)
 NXP_SWITCH_READY_PATTERN = re.compile(r"(?:^|\n)Switch ready\s*$", re.IGNORECASE | re.MULTILINE)
 NXP_FPGA_READY_PATTERN = re.compile(r"(?:^|\n)FPGA ready\s*$", re.IGNORECASE | re.MULTILINE)
+DIG_SN_PATTERN = re.compile(r"^[A-Z]{5}-\d{2}-\d{4}-(?:\d{6}|[A-Z]\d)-\d{3,5}$")
+SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ConfigError(RuntimeError):
@@ -134,18 +143,17 @@ def load_simple_yaml(path: pathlib.Path) -> dict[str, Any]:
     return root
 
 
-def normalize_mac(mac: str) -> str:
-    parts = mac.replace("-", ":").split(":")
-    if len(parts) != 6:
+def compact_mac(mac: str) -> str:
+    compact = mac.strip().replace(":", "").replace("-", "")
+    if len(compact) != 12:
         raise ValueError(f"Invalid MAC address: {mac}")
+    int(compact, 16)
+    return compact.upper()
 
-    normalized: list[str] = []
-    for part in parts:
-        if len(part) != 2:
-            raise ValueError(f"Invalid MAC address: {mac}")
-        int(part, 16)
-        normalized.append(part.upper())
-    return ":".join(normalized)
+
+def normalize_mac(mac: str) -> str:
+    compact = compact_mac(mac)
+    return ":".join(compact[index:index + 2] for index in range(0, 12, 2))
 
 
 def mac_plus(mac: str, increment: int) -> str:
@@ -153,6 +161,22 @@ def mac_plus(mac: str, increment: int) -> str:
     value = (value + increment) & ((1 << 48) - 1)
     packed = f"{value:012X}"
     return ":".join(packed[index:index + 2] for index in range(0, 12, 2))
+
+
+def normalize_dig_sn(dig_sn: str) -> str:
+    normalized = dig_sn.strip().upper()
+    if not DIG_SN_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "Unsupported DIG board serial number format. Expected formats like "
+            "CLSDM-09-0926-260528-002 or MLSDM-08-0726-B1-00010."
+        )
+    return normalized
+
+
+def validate_sql_identifier(name: str, label: str) -> str:
+    if not SQL_IDENTIFIER_PATTERN.fullmatch(name):
+        raise ConfigError(f"Invalid SQL identifier for {label}: {name}")
+    return name
 
 
 def manual_pause(message: str) -> None:
@@ -221,6 +245,18 @@ class TimeoutConfig:
 
 
 @dataclass(frozen=True)
+class DbConfig:
+    db_type: str
+    path: str
+    table: str
+    serial_column: str
+    mac_column_format: str
+    mac_count: int
+    seed_mac: str
+    auto_create: bool
+
+
+@dataclass(frozen=True)
 class AppConfig:
     nxp: SerialPortConfig
     switch_serial: SerialPortConfig
@@ -230,6 +266,7 @@ class AppConfig:
     sonic: SonicConfig
     prompts: PromptConfig
     timeouts: TimeoutConfig
+    db: DbConfig | None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any]) -> "AppConfig":
@@ -240,6 +277,7 @@ class AppConfig:
         sonic_cfg = payload["sonic"]
         prompts_cfg = payload["prompts"]
         timeouts_cfg = payload["timeouts"]
+        db_cfg = payload.get("db")
         return cls(
             nxp=SerialPortConfig(
                 port=str(serial_cfg["nxp"]["port"]),
@@ -287,6 +325,20 @@ class AppConfig:
                 emergency_boot_seconds=int(timeouts_cfg.get("emergency_boot_seconds", max(int(timeouts_cfg.get("sonic_boot_seconds", timeouts_cfg.get("first_boot_seconds", 300))) * 2, 600))),
                 first_boot_seconds=int(timeouts_cfg.get("first_boot_seconds", timeouts_cfg.get("uboot_boot_seconds", 300))),
                 sonic_boot_seconds=int(timeouts_cfg.get("sonic_boot_seconds", timeouts_cfg.get("first_boot_seconds", timeouts_cfg.get("uboot_boot_seconds", 300)))),
+            ),
+            db=(
+                DbConfig(
+                    db_type=str(db_cfg.get("type", "sqlite")),
+                    path=str(db_cfg["path"]),
+                    table=str(db_cfg.get("table", "dig_board_macs")),
+                    serial_column=str(db_cfg.get("serial_column", "dig_sn")),
+                    mac_column_format=str(db_cfg.get("mac_column_format", "mac{index}")),
+                    mac_count=int(db_cfg.get("mac_count", 16)),
+                    seed_mac=normalize_mac(str(db_cfg.get("seed_mac", "00:00:00:00:00:00"))),
+                    auto_create=bool(db_cfg.get("auto_create", True)),
+                )
+                if db_cfg is not None
+                else None
             ),
         )
 
@@ -464,18 +516,34 @@ def run_command_wait_text(
     expected_text: str,
     timeout: int,
     description: str | None = None,
+    progress_label: str | None = None,
 ) -> str:
     if description:
         info(f"{session.name}: {description}")
     start_pos = len(session.buffer)
     session.send_line(command)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        session.poll()
-        segment = session.buffer[start_pos:]
-        if expected_text in segment:
-            return segment
-        time.sleep(0.05)
+    progress = None
+    last_progress_second = 0
+    if progress_label and tqdm is not None:
+        progress = tqdm(total=timeout, desc=progress_label, unit="s", leave=True, dynamic_ncols=True)
+    try:
+        while time.monotonic() < deadline:
+            session.poll()
+            segment = session.buffer[start_pos:]
+            if expected_text in segment:
+                if progress is not None and last_progress_second < timeout:
+                    progress.update(timeout - last_progress_second)
+                return segment
+            if progress is not None:
+                elapsed_seconds = min(timeout, int(time.monotonic() - (deadline - timeout)))
+                if elapsed_seconds > last_progress_second:
+                    progress.update(elapsed_seconds - last_progress_second)
+                    last_progress_second = elapsed_seconds
+            time.sleep(0.05)
+    finally:
+        if progress is not None:
+            progress.close()
     raise TimeoutError(f"Timed out waiting for command completion for: {command} on {session.name} ({session.config.port})")
     return session.buffer[start_pos:]
 
@@ -640,28 +708,52 @@ def ensure_sonic_shell(session: SerialSession, config: AppConfig, shell_prompt: 
 
 def wait_for_switch_reboot_request(session: SerialSession, timeout: int) -> None:
     start_pos = len(session.buffer)
-    result = session.wait_for_any_pattern(
-        {
-            "reboot": SWITCH_REBOOT_REQUEST_PATTERN,
-            "wrong_format": SWITCH_BOOTM_WRONG_FORMAT_PATTERN,
-            "kernel_error": SWITCH_BOOTM_KERNEL_ERROR_PATTERN,
-        },
-        timeout=timeout,
-        label="switch reboot request",
-        start_pos=start_pos,
-    )
-    if result == "wrong_format":
-        message = "Switch bootm failed: Wrong Image Format for bootm command"
-        session.log_event("ERROR", message)
-        raise RuntimeError(message)
-    if result == "kernel_error":
-        message = "Switch bootm failed: ERROR: can't get kernel image!"
-        session.log_event("ERROR", message)
-        raise RuntimeError(message)
+    deadline = time.monotonic() + timeout
+    progress = None
+    last_progress_second = 0
+    if tqdm is not None:
+        progress = tqdm(total=timeout, desc="Switch reboot request", unit="s", leave=True, dynamic_ncols=True)
+    try:
+        while time.monotonic() < deadline:
+            session.poll()
+            segment = session.buffer[start_pos:]
+            if SWITCH_REBOOT_REQUEST_PATTERN.search(segment):
+                if progress is not None and last_progress_second < timeout:
+                    progress.update(timeout - last_progress_second)
+                return
+            if SWITCH_BOOTM_WRONG_FORMAT_PATTERN.search(segment):
+                message = "Switch bootm failed: Wrong Image Format for bootm command"
+                session.log_event("ERROR", message)
+                raise RuntimeError(message)
+            if SWITCH_BOOTM_KERNEL_ERROR_PATTERN.search(segment):
+                message = "Switch bootm failed: ERROR: can't get kernel image!"
+                session.log_event("ERROR", message)
+                raise RuntimeError(message)
+            if progress is not None:
+                elapsed_seconds = min(timeout, int(time.monotonic() - (deadline - timeout)))
+                if elapsed_seconds > last_progress_second:
+                    progress.update(elapsed_seconds - last_progress_second)
+                    last_progress_second = elapsed_seconds
+            time.sleep(0.05)
+    finally:
+        if progress is not None:
+            progress.close()
+    raise TimeoutError(f"Timed out waiting for switch reboot request on {session.name} ({session.config.port})")
 
 
 def wait_with_operator_timer(total_seconds: int, label: str) -> None:
     info(f"{label}: waiting about {total_seconds // 60}:{total_seconds % 60:02d}")
+    if tqdm is not None:
+        for _ in tqdm(
+            range(total_seconds),
+            desc=label,
+            unit="s",
+            leave=True,
+            dynamic_ncols=True,
+        ):
+            time.sleep(1)
+        info(f"{label}: timer completed")
+        return
     remaining = total_seconds
     while remaining > 0:
         chunk = 60 if remaining > 60 else remaining
@@ -818,8 +910,162 @@ def remote_server_path(server: ServerConfig, filename: str) -> str:
     return f"/home/{server.login}/{image_path}/{filename}"
 
 
+def build_db_path(config_path: pathlib.Path, db_config: DbConfig) -> pathlib.Path:
+    db_path = pathlib.Path(db_config.path)
+    if db_path.is_absolute():
+        return db_path
+    return (config_path.parent / db_path).resolve()
+
+
+def mac_column_names(db_config: DbConfig) -> list[str]:
+    columns = [db_config.mac_column_format.format(index=index) for index in range(1, db_config.mac_count + 1)]
+    return [validate_sql_identifier(column, f"db.mac_column_format[{position}]") for position, column in enumerate(columns, start=1)]
+
+
+def normalize_optional_mac(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    return compact_mac(text)
+
+
+def create_db_table_if_needed(connection: sqlite3.Connection, db_config: DbConfig) -> None:
+    if not db_config.auto_create:
+        return
+
+    table = validate_sql_identifier(db_config.table, "db.table")
+    serial_column = validate_sql_identifier(db_config.serial_column, "db.serial_column")
+    mac_columns = mac_column_names(db_config)
+    mac_fields = ", ".join(f"{column} TEXT" for column in mac_columns)
+    connection.execute(
+        f"CREATE TABLE IF NOT EXISTS {table} ({serial_column} TEXT PRIMARY KEY, {mac_fields})"
+    )
+    connection.commit()
+
+
+def open_db_connection(config_path: pathlib.Path, db_config: DbConfig) -> sqlite3.Connection:
+    if db_config.db_type.lower() != "sqlite":
+        raise ConfigError(f"Unsupported db.type: {db_config.db_type}. Only 'sqlite' is supported right now.")
+
+    db_path = build_db_path(config_path, db_config)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    create_db_table_if_needed(connection, db_config)
+    return connection
+
+
+def fetch_serial_row(connection: sqlite3.Connection, db_config: DbConfig, dig_sn: str) -> sqlite3.Row | None:
+    table = validate_sql_identifier(db_config.table, "db.table")
+    serial_column = validate_sql_identifier(db_config.serial_column, "db.serial_column")
+    columns = [serial_column, *mac_column_names(db_config)]
+    row = connection.execute(
+        f"SELECT {', '.join(columns)} FROM {table} WHERE {serial_column} = ?",
+        (dig_sn,),
+    ).fetchone()
+    return row
+
+
+def find_latest_saved_mac(connection: sqlite3.Connection, db_config: DbConfig) -> str | None:
+    table = validate_sql_identifier(db_config.table, "db.table")
+    max_mac_value: int | None = None
+    for column in mac_column_names(db_config):
+        for row in connection.execute(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL AND TRIM({column}) <> ''"):
+            normalized = normalize_optional_mac(row[0])
+            if normalized is None:
+                continue
+            value = int(normalized.replace(":", ""), 16)
+            if max_mac_value is None or value > max_mac_value:
+                max_mac_value = value
+
+    if max_mac_value is None:
+        return None
+
+    packed = f"{max_mac_value:012X}"
+    return ":".join(packed[index:index + 2] for index in range(0, 12, 2))
+
+
+def existing_row_macs(row: sqlite3.Row, db_config: DbConfig) -> list[str | None]:
+    return [normalize_optional_mac(row[column]) for column in mac_column_names(db_config)]
+
+
+def build_mac_block(base_mac: str, count: int) -> list[str]:
+    return [normalize_mac(mac_plus(base_mac, offset)) for offset in range(count)]
+
+
+def infer_base_mac_from_existing(row_macs: list[str | None]) -> str | None:
+    for index, mac in enumerate(row_macs):
+        if mac is None:
+            continue
+        return compact_mac(mac_plus(mac, -index))
+    return None
+
+
+def upsert_serial_row(connection: sqlite3.Connection, db_config: DbConfig, dig_sn: str, macs: list[str]) -> None:
+    table = validate_sql_identifier(db_config.table, "db.table")
+    serial_column = validate_sql_identifier(db_config.serial_column, "db.serial_column")
+    mac_columns = mac_column_names(db_config)
+    placeholders = ", ".join("?" for _ in range(len(mac_columns) + 1))
+    columns = ", ".join([serial_column, *mac_columns])
+    updates = ", ".join(f"{column} = excluded.{column}" for column in mac_columns)
+    connection.execute(
+        f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT({serial_column}) DO UPDATE SET {updates}",
+        [dig_sn, *macs],
+    )
+    connection.commit()
+
+
+def print_mac_block(dig_sn: str, macs: list[str]) -> None:
+    info(f"DIG SN: {dig_sn}")
+    for index, mac in enumerate(macs, start=1):
+        print(f"mac{index:02d}: {mac}", flush=True)
+
+
+def run_gen_mac_mode(config: AppConfig, args: argparse.Namespace, config_path: pathlib.Path) -> int:
+    if config.db is None:
+        raise ConfigError("gen_mac mode requires a 'db' section in the YAML configuration.")
+    if not args.dig_sn:
+        raise ValueError("gen_mac mode requires: --dig_sn")
+
+    dig_sn = normalize_dig_sn(args.dig_sn)
+    db_config = config.db
+
+    with open_db_connection(config_path, db_config) as connection:
+        row = fetch_serial_row(connection, db_config, dig_sn)
+        if row is not None:
+            current_macs = existing_row_macs(row, db_config)
+            if all(mac is not None for mac in current_macs):
+                ok("Serial number already exists and all 16 MAC addresses are already filled.")
+                print_mac_block(dig_sn, [mac for mac in current_macs if mac is not None])
+                return 0
+
+            base_mac = infer_base_mac_from_existing(current_macs)
+            if base_mac is None:
+                latest_saved_mac = find_latest_saved_mac(connection, db_config)
+                base_mac = normalize_mac(mac_plus(latest_saved_mac or db_config.seed_mac, 1 if latest_saved_mac else 0))
+            new_macs = build_mac_block(base_mac, db_config.mac_count)
+            warn("Serial number exists but the MAC range is incomplete. Rebuilding all 16 MAC addresses.")
+            upsert_serial_row(connection, db_config, dig_sn, new_macs)
+            ok("Database row updated with 16 sequential MAC addresses.")
+            print_mac_block(dig_sn, new_macs)
+            return 0
+
+        latest_saved_mac = find_latest_saved_mac(connection, db_config)
+        base_mac = normalize_mac(mac_plus(latest_saved_mac or db_config.seed_mac, 1 if latest_saved_mac else 0))
+        new_macs = build_mac_block(base_mac, db_config.mac_count)
+        info("Serial number was not found. Creating a new database row with the next 16 MAC addresses.")
+        upsert_serial_row(connection, db_config, dig_sn, new_macs)
+        ok("Database row created with 16 sequential MAC addresses.")
+        print_mac_block(dig_sn, new_macs)
+    return 0
+
+
 @dataclass(frozen=True)
 class ProvisionArgs:
+    dig_sn: str | None
     base_mac: str
     nxp_mac1: str
     nxp_mac2: str
@@ -830,24 +1076,91 @@ class ProvisionArgs:
     switch_image: str
     switch_itb: str
     skip_utils: bool
+    allocated_macs: tuple[str, ...] | None
+    mac_notice: str | None
+
+
+def log_selected_macs(sessions: list[SerialSession], provision: ProvisionArgs) -> None:
+    for session in sessions:
+        if provision.dig_sn:
+            session.log_event("INFO", f"DIG SN: {provision.dig_sn}")
+        if provision.mac_notice:
+            session.log_event("INFO", provision.mac_notice)
+        session.log_event("INFO", f"Selected NXP base MAC: {provision.base_mac}")
+        session.log_event("INFO", f"Selected switch MAC: {provision.switch_uboot_mac}")
+        session.log_event("INFO", f"Selected switch ONIE MAC: {provision.switch_onie_mac}")
+        if provision.allocated_macs:
+            for index, mac in enumerate(provision.allocated_macs, start=1):
+                session.log_event("INFO", f"mac{index:02d}: {mac}")
+
+
+def build_gen_mac_command(dig_sn: str) -> str:
+    return f"python .\\lscript.py --mode gen_mac --dig_sn {dig_sn}"
+
+
+def resolve_provision_macs_from_db(config: AppConfig, args: argparse.Namespace) -> tuple[str, str, str, tuple[str, ...], str]:
+    if config.db is None:
+        raise ConfigError("provision mode with --dig_sn requires a 'db' section in the YAML configuration.")
+    if not args.dig_sn:
+        raise ValueError("provision mode requires either --base-mac or --dig_sn")
+
+    dig_sn = normalize_dig_sn(args.dig_sn)
+    db_config = config.db
+
+    with open_db_connection(pathlib.Path(args.config).resolve(), db_config) as connection:
+        row = fetch_serial_row(connection, db_config, dig_sn)
+        if row is not None:
+            row_macs = existing_row_macs(row, db_config)
+            if all(mac is not None for mac in row_macs):
+                allocated_macs = tuple(normalize_mac(mac) for mac in row_macs if mac is not None)
+                return normalize_mac(allocated_macs[0]), normalize_mac(allocated_macs[1]), dig_sn, allocated_macs, "Using existing MAC allocation from database."
+
+            base_mac = infer_base_mac_from_existing(row_macs)
+            if base_mac is None:
+                latest_saved_mac = find_latest_saved_mac(connection, db_config)
+                base_mac = normalize_mac(mac_plus(latest_saved_mac or db_config.seed_mac, 1 if latest_saved_mac else 0))
+            new_macs = tuple(build_mac_block(base_mac, db_config.mac_count))
+            upsert_serial_row(connection, db_config, dig_sn, list(new_macs))
+            return normalize_mac(new_macs[0]), normalize_mac(new_macs[1]), dig_sn, new_macs, "Serial number existed with incomplete MAC data. Rebuilt and saved a new 16-MAC block."
+
+        latest_saved_mac = find_latest_saved_mac(connection, db_config)
+        base_mac = normalize_mac(mac_plus(latest_saved_mac or db_config.seed_mac, 1 if latest_saved_mac else 0))
+        new_macs = tuple(build_mac_block(base_mac, db_config.mac_count))
+        upsert_serial_row(connection, db_config, dig_sn, list(new_macs))
+        return normalize_mac(new_macs[0]), normalize_mac(new_macs[1]), dig_sn, new_macs, "New serial number detected. Created and saved a new 16-MAC block."
 
 
 def build_provision_args(config: AppConfig, args: argparse.Namespace) -> ProvisionArgs:
-    if args.mode in {"mac-only", "provision"} and args.base_mac is None:
+    if args.mode in {"mac-only", "provision"} and args.base_mac is None and args.mode != "provision":
         raise ValueError(f"{args.mode} mode requires: --base-mac")
 
-    base_mac = normalize_mac(args.base_mac)
+    dig_sn: str | None = None
+    allocated_macs: tuple[str, ...] | None = None
+    mac_notice: str | None = None
+    if args.mode == "provision" and args.base_mac is None:
+        base_mac, switch_mac, dig_sn, allocated_macs, mac_notice = resolve_provision_macs_from_db(config, args)
+        print_mac_block(dig_sn, list(allocated_macs))
+        ok(mac_notice)
+    else:
+        if args.base_mac is None:
+            raise ValueError(f"{args.mode} mode requires: --base-mac")
+        base_mac = normalize_mac(args.base_mac)
+        switch_mac = normalize_mac(args.switch_uboot_mac or mac_plus(base_mac, 1))
+
     return ProvisionArgs(
+        dig_sn=dig_sn,
         base_mac=base_mac,
         nxp_mac1="00:04:9F:08:44:A2",
         nxp_mac2="00:04:9F:08:44:A3",
         nxp_mac3="00:04:9F:08:44:A4",
-        switch_uboot_mac=normalize_mac(args.switch_uboot_mac or mac_plus(base_mac, 1)),
-        switch_onie_mac=normalize_mac(args.switch_onie_mac or mac_plus(base_mac, 1)),
+        switch_uboot_mac=switch_mac,
+        switch_onie_mac=normalize_mac(args.switch_onie_mac or switch_mac),
         deploy_script=args.deploy_script or config.dut.image_file,
         switch_image=args.switch_image or config.sonic.image_file,
         switch_itb=args.switch_itb or config.switch.image_file,
         skip_utils=bool(args.skip_utils),
+        allocated_macs=allocated_macs,
+        mac_notice=mac_notice,
     )
 
 
@@ -993,6 +1306,30 @@ def configure_emergency_linux(session: SerialSession, config: AppConfig, provisi
         emergency_prompt_text,
         max(config.timeouts.emergency_boot_seconds * 4, 600),
         "Run the LSBB deploy script",
+        progress_label="NXP deploy script",
+    )
+
+
+def boot_nxp_from_uboot(session: SerialSession) -> None:
+    info("DUT resetting: sending U-Boot boot command on NXP")
+    session.log_event("INFO", "DUT resetting from NXP U-Boot via boot command.")
+    time.sleep(1)
+    session.send_line("boot")
+
+
+def reboot_nxp_from_linux(session: SerialSession, config: AppConfig, reason: str, delay_seconds: int = 0) -> None:
+    ensure_linux_shell(session, config.dut.login, config.dut.password, ROOT_SHELL_PATTERN, config.timeouts.emergency_boot_seconds)
+    if delay_seconds > 0:
+        time.sleep(delay_seconds)
+    info(f"DUT resetting: {reason}")
+    session.log_event("INFO", f"DUT resetting: {reason}")
+    start_pos = len(session.buffer)
+    session.send_line("reboot")
+    session.wait_for_pattern(
+        NXP_REBOOT_TRANSITION_PATTERN,
+        timeout=max(config.timeouts.prompt_wait_seconds, 60),
+        label="NXP reboot transition",
+        start_pos=start_pos,
     )
 
 
@@ -1231,6 +1568,7 @@ def run_mac_only_mode(config: AppConfig, args: argparse.Namespace, repo_root: pa
             switch_log,
             config.timeouts.serial_open_seconds,
         ) as switch:
+            log_selected_macs([nxp], provision)
             nxp_ready, switch_ready, switch_prompt = monitor_boot_parallel(
                 nxp=nxp,
                 switch=switch,
@@ -1274,6 +1612,7 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
             switch_log,
             config.timeouts.serial_open_seconds,
         ) as switch:
+            log_selected_macs([nxp], provision)
             info("Stopping NXP autoboot and entering U-Boot")
             nxp_ready, switch_ready, switch_prompt = monitor_boot_parallel(
                 nxp=nxp,
@@ -1291,20 +1630,19 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
 
             burn_nxp_macs(nxp, provision, config.timeouts.prompt_wait_seconds)
             burn_switch_uboot_mac(switch, switch_prompt, provision, config.timeouts.prompt_wait_seconds)
-
-            manual_pause("Press the DUT reset button so the system boots into emergency Linux on the NXP side.")
+            boot_nxp_from_uboot(nxp)
             configure_emergency_linux(nxp, config, provision)
 
-            manual_pause("Press the DUT reset button after the deploy script completes.")
+            reboot_nxp_from_linux(nxp, config, "rebooting after deploy script completed")
             configure_installed_linux(nxp, config)
 
-            manual_pause("Press the DUT reset button again so the saved network configuration is active.")
+            reboot_nxp_from_linux(nxp, config, "rebooting after persistent DUT IP configuration", delay_seconds=1)
             switch_prompt = stage_switch_images(nxp, switch, config, provision)
 
             info("Switch U-Boot serverip probe completed; starting ONIE image install")
             install_switch_image(switch, switch_prompt, config, provision)
 
-            info("Waiting for switch reboot request on COM21 after bootm")
+            info(f"Waiting for switch reboot request on {config.switch_serial.port} after bootm")
             wait_for_switch_reboot_request(switch, 240)
             time.sleep(5)
             info("Switch reboot request detected; pulsing reset from NXP")
@@ -1322,7 +1660,7 @@ def run_provision_mode(config: AppConfig, args: argparse.Namespace, repo_root: p
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    ok("Provisioning flow completed")
+    ok("Full installation and board configuration completed successfully")
     return 0
 
 
@@ -1335,9 +1673,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["detect", "mac-only", "provision"],
+        choices=["detect", "mac-only", "provision", "gen_mac"],
         default="detect",
-        help="Run the quick prompt detector, MAC-only flow, or the full provisioning flow.",
+        help="Run the quick prompt detector, MAC-only flow, full provisioning flow, or DB-backed MAC generation.",
     )
     parser.add_argument(
         "--boot-stop-key",
@@ -1379,6 +1717,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not copy LSBB_Utils or run its test suite.",
     )
+    parser.add_argument("--dig_sn", help="DIG board serial number used by gen_mac or DB-backed provision mode.")
     return parser
 
 
@@ -1389,12 +1728,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(config_path)
+        if args.mode == "gen_mac":
+            return run_gen_mac_mode(config, args, config_path)
         if args.mode == "mac-only":
             return run_mac_only_mode(config, args, repo_root)
         if args.mode == "provision":
             return run_provision_mode(config, args, repo_root)
         return run_detect_mode(config, args, repo_root)
-    except (OSError, ConfigError, ValueError) as exc:
+    except (OSError, ConfigError, ValueError, sqlite3.Error) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 

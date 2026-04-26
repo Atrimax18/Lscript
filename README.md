@@ -2,13 +2,38 @@
 
 Windows-driven serial automation for the LSBB lab flow.
 
-The script now supports three modes:
+The script now supports four modes:
 
 - `detect`: stop NXP autoboot on `COM20` and confirm the switch `Telesat>>` prompt on `COM21`
 - `mac-only`: stop both sides in U-Boot, program NXP and switch MACs, and stop there
 - `provision`: run the documented flow from MAC programming through Linux install, switch image install, SONiC setup, and `LSBB_Utils` copy
+- `gen_mac`: read and update the MAC database from the YAML `db` section using a DIG board serial number
 
 Serial logs are saved under `logs/`, and both `COM20` and `COM21` are opened and logged from the start of the run.
+
+If `tqdm` is installed, long operator-visible waits such as the SONiC first-boot timer are shown with a progress bar. Without `tqdm`, the script falls back to the built-in text countdown.
+
+## YAML Configuration
+
+The script reads its runtime settings from [script_setup.yaml](C:/Users/alexeyt/source/repos/Lscript/script_setup.yaml).
+
+- `serial`
+  Defines the serial ports and baud rates. `nxp` is the NXP terminal, `switch` is the switch terminal, and `sx1` / `sx2` are extra ports kept in the config.
+- `server`
+  Defines the Linux image server used for SCP: server IP, login, password, and remote image path.
+- `dut`
+  Defines NXP-side Linux settings such as final management IP, login, password, temporary folder, deploy script filename, and emergency shell prompt.
+- `switch`
+  Defines switch-side U-Boot settings such as switch management IP, U-Boot prompt text, and default ITB filename.
+- `sonic`
+  Defines SONiC login settings: login user, password, login prompt, shell prompt, and default SONiC image filename.
+- `prompts`
+  Defines generic prompt text used for U-Boot and switch prompt detection.
+- `timeouts`
+  Controls all wait timers:
+  `serial_open_seconds`, `prompt_wait_seconds`, `boot_interrupt_seconds`, `uboot_boot_seconds`, `emergency_boot_seconds`, `first_boot_seconds`, and `sonic_boot_seconds`.
+- `db`
+  Defines the SQLite MAC database used by `--dig_sn`, including DB path, table, serial column, MAC column naming pattern, and MAC count.
 
 ## Detect Mode
 
@@ -28,6 +53,44 @@ To validate only the NXP side:
 ```powershell
 python .\lscript.py --mode detect --skip-switch
 ```
+
+## DB MAC Generation Mode
+
+Use the DB-backed allocator when you want the script to manage a row of 16 MAC addresses for a DIG board serial number:
+
+```powershell
+python .\lscript.py --mode gen_mac --dig_sn CLSDM-09-0926-260528-002
+```
+
+Supported DIG SN formats currently include:
+
+- `CLSDM-09-0926-260528-002`
+- `MLSDM-08-0726-B1-00010`
+
+What `gen_mac` does:
+
+- validates the DIG SN format
+- connects to the database defined under `db:` in [script_setup.yaml](C:/Users/alexeyt/source/repos/Lscript/script_setup.yaml)
+- checks whether the serial number already exists
+- if the serial exists and all 16 MAC fields are already filled, prints the existing block and does not modify the DB
+- if the serial exists but the MAC block is incomplete, prints a message and rewrites all 16 MAC addresses as a sequential `+1` range
+- if the serial does not exist, finds the latest saved MAC address in the DB, creates the next sequential block of 16 MAC addresses, inserts the DIG SN, and prints the assigned range
+
+Current DB config keys:
+
+- `db.type`
+  Right now only `sqlite` is supported
+- `db.path`
+  Relative paths are resolved next to the YAML file
+- `db.table`
+- `db.serial_column`
+- `db.mac_column_format`
+  Example: `mac{index}` gives `mac1` through `mac16`
+- `db.mac_count`
+- `db.seed_mac`
+  Used as the first MAC only when the database has no saved MACs yet
+- `db.auto_create`
+  When `true`, the SQLite table is created automatically if it does not exist
 
 ## Provision Mode
 
@@ -100,7 +163,9 @@ python .\lscript.py --mode provision `
 - Writes NXP `mac 0` from the runtime argument
 - Writes fixed NXP values to `mac 1`, `mac 2`, and `mac 3`
 - Burns the switch U-Boot MAC with `setenv ethaddr` using `base-mac + 1`
-- Pauses for the physical DUT reset into emergency Linux, waits for the maintenance message, and then waits for the `sh-5.2#` prompt on the NXP terminal
+- After MAC programming, waits 1 second and sends `boot` on the NXP side to continue automatically into emergency Linux
+- Shows/logs that the DUT is resetting instead of asking the operator to press the reset button
+- Waits for the maintenance message, and then waits for the `sh-5.2#` prompt on the NXP terminal
 - Configures DUT IP and verifies image-server reachability with one combined emergency command:
   `ifconfig eth0 10.10.10.2 ; ping 10.10.10.1 -c1`
 - Continues only after detecting:
@@ -110,9 +175,10 @@ python .\lscript.py --mode provision `
   `scp deploy@10.10.10.1:/home/deploy/images/deploy-lsbb-1.1.1-20260324.sh /tmp`
 - Handles SCP first-connect prompts by sending `y` for Dropbear-style host-key confirmation and then sends `server.password` from YAML
 - Verifies the deploy script appears in `/tmp`, and only then runs it
-- Pauses for the documented reset-button steps
+- After the deploy script completes, logs in on NXP if needed with `root` / `toor` and sends `reboot`
 - Configures persistent DUT networking with `nmcli`
 - After `nmcli con mod fm1-mac5-static connection.autoconnect yes`, waits 2 seconds, sends Enter twice, and only then shows the next reset-button action
+- After the persistent NXP IP configuration is saved, waits 1 second and sends `reboot` automatically instead of asking the operator to press reset
 - Copies switch image files to `/tmp`
 - Configures `fm1-mac10` as `192.168.2.1/24`
 - After `nmcli con show` on the NXP terminal, switches to COM21 and sends `ping $serverip` from the switch U-Boot prompt
@@ -144,13 +210,13 @@ python .\lscript.py --mode provision `
 
 ## Manual Intervention Points
 
-The procedure still requires an operator for the physical steps from the manual:
+The NXP reset-button steps are now automated by the script:
 
-- Press the DUT reset button after MAC programming
-- Press the DUT reset button after the deploy script completes
-- Press the DUT reset button again after saving the persistent DUT IP configuration
+- after MAC programming, the script sends `boot`
+- after the deploy script completes, the script sends `reboot`
+- after the persistent NXP IP configuration is saved, the script sends `reboot`
 
-The script pauses at each of those points and continues when Enter is pressed.
+The remaining operator-visible waits are mainly informational, such as the SONiC first-boot timer and progress bars.
 
 ## Known Manual Gaps
 
@@ -178,3 +244,13 @@ This mode does only:
 - write fixed NXP values to `mac 1`, `mac 2`, `mac 3`
 - write switch `ethaddr` as `base-mac + 1`
 - save both sides and exit
+
+## Final Status
+
+On successful completion, the script ends with:
+
+```text
+[OK] Full installation and board configuration completed successfully
+```
+
+If something fails, the script ends with an `[ERROR] ...` message that describes the failure point.
